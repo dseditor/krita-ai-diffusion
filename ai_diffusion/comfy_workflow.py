@@ -302,6 +302,8 @@ class ComfyWorkflow:
         return self.add("RescaleCFG", 1, model=model, multiplier=multiplier)
 
     def load_checkpoint(self, checkpoint: str):
+        if "nf4" in checkpoint and "flux" in checkpoint:
+           return self.add("CheckpointLoaderNF4", 3, ckpt_name=checkpoint)
         return self.add_cached("CheckpointLoaderSimple", 3, ckpt_name=checkpoint)
 
     def load_dual_clip(self, clip_name1: str, clip_name2: str, type="sd3"):
