@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable, cast
+from typing import Any, Callable, cast
 
 from PyQt5.QtWidgets import (
     QAction,
@@ -7,13 +7,11 @@ from PyQt5.QtWidgets import (
     QWidget,
     QPlainTextEdit,
     QLabel,
-    QLineEdit,
     QMenu,
     QSpinBox,
     QToolButton,
     QComboBox,
     QHBoxLayout,
-    QVBoxLayout,
     QSizePolicy,
     QStyle,
     QStyleOption,
@@ -22,32 +20,36 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QPushButton,
     QFrame,
+    QScrollBar,
 )
 from PyQt5.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QGuiApplication,
     QFontMetrics,
     QKeyEvent,
     QMouseEvent,
     QPalette,
     QTextCursor,
     QPainter,
-    QIcon,
     QPaintEvent,
     QKeySequence,
 )
-from PyQt5.QtCore import QObject, Qt, QMetaObject, QSize, pyqtSignal, QEvent
+from PyQt5.QtCore import Qt, QMetaObject, QSize, pyqtSignal, QEvent, QUrl
+from krita import Krita
 
 from ..style import Style, Styles
 from ..root import root
-from ..client import filter_supported_styles, resolve_sd_version
+from ..client import filter_supported_styles, resolve_arch
 from ..properties import Binding, Bind, bind, bind_combo
 from ..jobs import JobState, JobKind
-from ..model import Model, Workspace, SamplingQuality
+from ..model import Model, Workspace, SamplingQuality, ProgressKind, ErrorKind, Error, no_error
 from ..text import edit_attention, select_on_cursor_pos
 from ..localization import translate as _
 from ..util import ensure
 from ..workflow import apply_strength, snap_to_percent
+from ..settings import Settings, settings
 from .autocomplete import PromptAutoComplete
-from .settings import SettingsDialog, settings
 from .theme import SignalBlocker
 from . import actions, theme
 
@@ -111,15 +113,32 @@ class QueuePopup(QMenu):
         seed_layout.addWidget(self._randomize_seed)
         self._layout.addLayout(seed_layout, 1, 1)
 
+        resolution_multiplier_label = QLabel(_("Resolution"), self)
+        self._resolution_multiplier_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self._resolution_multiplier_slider.setRange(3, 15)
+        self._resolution_multiplier_slider.setValue(10)
+        self._resolution_multiplier_slider.setSingleStep(1)
+        self._resolution_multiplier_slider.setPageStep(1)
+        self._resolution_multiplier_slider.setToolTip(Settings._resolution_multiplier.desc)
+        self._resolution_multiplier_slider.valueChanged.connect(self._set_resolution_multiplier)
+        self._resolution_multiplier_display = QLabel("1.0 x", self)
+        self._resolution_multiplier_display.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._resolution_multiplier_display.setMinimumWidth(20)
+        resolution_multiplier_layout = QHBoxLayout()
+        resolution_multiplier_layout.addWidget(self._resolution_multiplier_slider)
+        resolution_multiplier_layout.addWidget(self._resolution_multiplier_display)
+        self._layout.addWidget(resolution_multiplier_label, 2, 0)
+        self._layout.addLayout(resolution_multiplier_layout, 2, 1)
+
         enqueue_label = QLabel(_("Enqueue"), self)
         self._queue_front_combo = QComboBox(self)
         self._queue_front_combo.addItem(_("in Front (new jobs first)"), True)
         self._queue_front_combo.addItem(_("at the Back"), False)
-        self._layout.addWidget(enqueue_label, 2, 0)
-        self._layout.addWidget(self._queue_front_combo, 2, 1)
+        self._layout.addWidget(enqueue_label, 3, 0)
+        self._layout.addWidget(self._queue_front_combo, 3, 1)
 
         cancel_label = QLabel(_("Cancel"), self)
-        self._layout.addWidget(cancel_label, 3, 0)
+        self._layout.addWidget(cancel_label, 4, 0)
         self._cancel_active = self._create_cancel_button(_("Active"), actions.cancel_active)
         self._cancel_queued = self._create_cancel_button(_("Queued"), actions.cancel_queued)
         self._cancel_all = self._create_cancel_button(_("All"), actions.cancel_all)
@@ -127,7 +146,7 @@ class QueuePopup(QMenu):
         cancel_layout.addWidget(self._cancel_active)
         cancel_layout.addWidget(self._cancel_queued)
         cancel_layout.addWidget(self._cancel_all)
-        self._layout.addLayout(cancel_layout, 3, 1)
+        self._layout.addLayout(cancel_layout, 4, 1)
 
         self._model = root.active_model
 
@@ -151,6 +170,7 @@ class QueuePopup(QMenu):
             self._model.fixed_seed_changed.connect(self._seed_input.setEnabled),
             self._model.fixed_seed_changed.connect(self._randomize_seed.setEnabled),
             self._randomize_seed.clicked.connect(self._model.generate_seed),
+            model.resolution_multiplier_changed.connect(self._update_resolution_multiplier),
             bind_combo(self._model, "queue_front", self._queue_front_combo),
             model.jobs.count_changed.connect(self._update_cancel_buttons),
         ]
@@ -171,20 +191,26 @@ class QueuePopup(QMenu):
         self._cancel_queued.setEnabled(has_queued)
         self._cancel_all.setEnabled(has_active or has_queued)
 
-    def mouseReleaseEvent(self, a0: QMouseEvent | None) -> None:
+    def _update_resolution_multiplier(self):
+        slider_value = round(self.model.resolution_multiplier * 10)
+        if self._resolution_multiplier_slider.value() != slider_value:
+            self._resolution_multiplier_slider.setValue(slider_value)
+
+    def _set_resolution_multiplier(self, value: int):
+        self.model.resolution_multiplier = value / 10
+        self._resolution_multiplier_display.setText(f"{(value / 10):.1f} x")
+
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
         if parent := cast(QWidget, self.parent()):
             parent.close()
-        return super().mouseReleaseEvent(a0)
+        return super().closeEvent(a0)
 
 
 class QueueButton(QToolButton):
-    _model: Model
-    _popup: QueuePopup
-
     def __init__(self, supports_batch=True, parent: QWidget | None = None):
         super().__init__(parent)
         self._model = root.active_model
-        self._model.jobs.count_changed.connect(self._update)
+        self._connect_model()
 
         self._popup = QueuePopup(supports_batch)
         popup_action = QWidgetAction(self)
@@ -201,21 +227,33 @@ class QueueButton(QToolButton):
 
     @model.setter
     def model(self, model: Model):
-        self._model.jobs.count_changed.disconnect(self._update)
-        self._model = model
-        self._popup.model = model
-        self._model.jobs.count_changed.connect(self._update)
+        if self._model != model:
+            Binding.disconnect_all(self._connections)
+            self._model = model
+            self._popup.model = model
+            self._connect_model()
+
+    def _connect_model(self):
+        self._connections = [
+            self._model.jobs.count_changed.connect(self._update),
+            self._model.progress_kind_changed.connect(self._update),
+        ]
 
     def _update(self):
         count = self._model.jobs.count(JobState.queued)
-        if self._model.jobs.any_executing():
+        queued_msg = _("{count} jobs queued.", count=count)
+        cancel_msg = _("Click to cancel.")
+
+        if self._model.progress_kind is ProgressKind.upload:
+            self.setIcon(theme.icon("queue-upload"))
+            self.setToolTip(_("Uploading models.") + f" {queued_msg} {cancel_msg}")
+            count += 1
+        elif self._model.jobs.any_executing():
             self.setIcon(theme.icon("queue-active"))
             if count > 0:
-                self.setToolTip(
-                    _("Generating image. {count} jobs queued - click to cancel.", count=count)
-                )
+                self.setToolTip(_("Generating image.") + f" {queued_msg} {cancel_msg}")
             else:
-                self.setToolTip(_("Generating image. Click to cancel."))
+                self.setToolTip(_("Generating image.") + f" {cancel_msg}")
             count += 1
         else:
             self.setIcon(theme.icon("queue-inactive"))
@@ -238,7 +276,7 @@ class StyleSelectWidget(QWidget):
     value_changed = pyqtSignal(Style)
     quality_changed = pyqtSignal(SamplingQuality)
 
-    def __init__(self, parent, show_quality=False):
+    def __init__(self, parent: QWidget | None, show_quality=False):
         super().__init__(parent)
         self._value = Styles.list().default
 
@@ -274,7 +312,7 @@ class StyleSelectWidget(QWidget):
         with SignalBlocker(self._combo):
             self._combo.clear()
             for style in self._styles:
-                icon = theme.sd_version_icon(resolve_sd_version(style, comfy))
+                icon = theme.checkpoint_icon(resolve_arch(style, comfy))
                 self._combo.addItem(icon, style.name, style.filename)
             if self._value in self._styles:
                 self._combo.setCurrentText(self._value.name)
@@ -293,6 +331,8 @@ class StyleSelectWidget(QWidget):
         self.quality_changed.emit(quality)
 
     def show_settings(self):
+        from .settings import SettingsDialog
+
         SettingsDialog.instance().show(self._value)
 
     @property
@@ -306,52 +346,74 @@ class StyleSelectWidget(QWidget):
             self._combo.setCurrentText(style.name)
 
 
-def handle_weight_adjustment(
-    self: MultiLineTextPromptWidget | SingleLineTextPromptWidget, event: QKeyEvent
-):
-    """Handles Ctrl + (arrow key up / arrow key down) attention weight adjustment."""
-    if event.key() in [Qt.Key.Key_Up, Qt.Key.Key_Down] and (event.modifiers() & Qt.Modifier.CTRL):
-        if self.hasSelectedText():
-            start = self.selectionStart()
-            end = self.selectionEnd()
-        else:
-            start, end = select_on_cursor_pos(self.text(), self.cursorPosition())
+class ResizeHandle(QWidget):
+    """A small resize handle that appears at the bottom of the prompt widget."""
 
-        text = self.text()
-        target_text = text[start:end]
-        text_after_edit = edit_attention(target_text, event.key() == Qt.Key.Key_Up)
-        self.setText(text[:start] + text_after_edit + text[end:])
-        if isinstance(self, MultiLineTextPromptWidget):
-            self.setSelection(start, start + len(text_after_edit))
-        else:
-            # Note: setSelection has some wield bug in `SingleLineTextPromptWidget`
-            # that the end range will be set to end of text. So set cursor instead
-            # as compromise.
-            self.setCursorPosition(start + len(text_after_edit) - 2)
+    handle_dragged = pyqtSignal(int)
 
-
-class MultiLineTextPromptWidget(QPlainTextEdit):
-    activated = pyqtSignal()
-
-    _line_count = 2
-
-    def __init__(self, parent):
+    def __init__(self, parent: QWidget):
         super().__init__(parent)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setFixedSize(22, 8)
+        self._dragging = False
+
+    def mousePressEvent(self, a0: QMouseEvent | None) -> None:
+        if ensure(a0).button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+
+    def mouseReleaseEvent(self, a0: QMouseEvent | None) -> None:
+        self._dragging = False
+
+    def mouseMoveEvent(self, a0: QMouseEvent | None) -> None:
+        if not self._dragging:
+            return
+        y_pos = self.mapToParent(ensure(a0).pos()).y()
+        self.handle_dragged.emit(y_pos)
+
+    def paintEvent(self, a0: QPaintEvent | None) -> None:
+        if not self.isVisible():
+            return
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText).lighter(100))
+        painter.setBrush(painter.pen().color())
+        w, h = self.width(), self.height()
+        for i, x in enumerate(range(2, w - 1, 3)):
+            y = 2 * h // 3 if i % 2 == 0 else h // 3
+            painter.drawEllipse(x - 1, y - 1, 2, 2)
+
+
+class TextPromptWidget(QPlainTextEdit):
+    activated = pyqtSignal()
+    text_changed = pyqtSignal(str)
+    handle_dragged = pyqtSignal(int)
+
+    def __init__(self, line_count=2, is_negative=False, parent=None):
+        super().__init__(parent)
+        self._line_count = line_count
+        self._is_negative = is_negative
+
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setTabChangesFocus(True)
         self.setFrameStyle(QFrame.Shape.NoFrame)
-        self.line_count = 2
 
         self._completer = PromptAutoComplete(self)
-        self.textChanged.connect(self._completer.check_completion)
+        self.textChanged.connect(self.notify_text_changed)
+
+        self._resize_handle: ResizeHandle | None = None
+
+        palette: QPalette = self.palette()
+        self._base_color = palette.color(QPalette.ColorRole.Base)
+        self.is_negative = is_negative
+        self.line_count = line_count
 
     def event(self, e: QEvent | None):
         assert e is not None
         # Ctrl+Backspace should be handled by QPlainTextEdit, not Krita.
         if e.type() == QEvent.Type.ShortcutOverride:
             assert isinstance(e, QKeyEvent)
-            if e.matches(QKeySequence.DeleteStartOfWord):
+            if e.matches(QKeySequence.StandardKey.DeleteStartOfWord):
                 e.accept()
         return super().event(e)
 
@@ -361,12 +423,66 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
             e.ignore()
             return
 
-        handle_weight_adjustment(self, e)
+        self.handle_weight_adjustment(e)
 
         if e.key() == Qt.Key.Key_Return and e.modifiers() == Qt.KeyboardModifier.ShiftModifier:
             self.activated.emit()
         else:
             super().keyPressEvent(e)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._resize_handle:
+            self._place_resize_handle()
+
+    def focusOutEvent(self, e):
+        super().focusOutEvent(e)
+        if scroll := self.verticalScrollBar():
+            scroll.triggerAction(QScrollBar.SliderAction.SliderToMinimum)
+
+    def focusNextPrevChild(self, next):
+        if self._completer.is_active:
+            return False
+        return super().focusNextPrevChild(next)
+
+    def notify_text_changed(self):
+        self._completer.check_completion()
+        self.text_changed.emit(self.text)
+
+    @property
+    def text(self):
+        return self.toPlainText()
+
+    @text.setter
+    def text(self, value: str):
+        if value == self.text:
+            return
+        with SignalBlocker(self):  # avoid auto-completion on non-user input
+            self.setPlainText(value)
+
+    @property
+    def is_resizable(self):
+        return self._resize_handle is not None
+
+    @is_resizable.setter
+    def is_resizable(self, value: bool):
+        if value and self._resize_handle is None:
+            self._resize_handle = ResizeHandle(self)
+            self._resize_handle.handle_dragged.connect(self.handle_dragged)
+            self._place_resize_handle()
+            self._resize_handle.show()
+        if not value and self._resize_handle is not None:
+            self._resize_handle.handle_dragged.disconnect(self.handle_dragged)
+            self._resize_handle.deleteLater()
+            self._resize_handle = None
+
+    def _place_resize_handle(self):
+        if self._resize_handle:
+            rect = self.geometry()
+            self._resize_handle.move(
+                (rect.width() - self._resize_handle.width()) // 2,
+                rect.height() - self._resize_handle.height(),
+            )
 
     @property
     def line_count(self):
@@ -376,124 +492,7 @@ class MultiLineTextPromptWidget(QPlainTextEdit):
     def line_count(self, value: int):
         self._line_count = value
         fm = QFontMetrics(ensure(self.document()).defaultFont())
-        self.setFixedHeight(fm.lineSpacing() * value + 8)
-
-    def hasSelectedText(self) -> bool:
-        return self.textCursor().hasSelection()
-
-    def selectionStart(self) -> int:
-        return self.textCursor().selectionStart()
-
-    def selectionEnd(self) -> int:
-        return self.textCursor().selectionEnd()
-
-    def cursorPosition(self) -> int:
-        return self.textCursor().position()
-
-    def setCursorPosition(self, pos: int):
-        cursor = self.textCursor()
-        cursor.setPosition(pos)
-        self.setTextCursor(cursor)
-
-    def text(self) -> str:
-        return self.toPlainText()
-
-    def setText(self, text: str):
-        self.setPlainText(text)
-
-    def setSelection(self, start: int, end: int):
-        new_cursor = self.textCursor()
-        new_cursor.setPosition(min(end, len(self.text())))
-        new_cursor.setPosition(min(start, len(self.text())), QTextCursor.KeepAnchor)
-        self.setTextCursor(new_cursor)
-
-
-class SingleLineTextPromptWidget(QLineEdit):
-
-    _completer: PromptAutoComplete
-
-    def __init__(self, parent: QWidget):
-        super().__init__(parent)
-        self._completer = PromptAutoComplete(self)
-        self.textChanged.connect(self._completer.check_completion)
-        self.setFrame(False)
-        self.setStyleSheet(f"QLineEdit {{ background: transparent; }}")
-
-    def keyPressEvent(self, a0: QKeyEvent | None):
-        assert a0 is not None
-        handle_weight_adjustment(self, a0)
-        super().keyPressEvent(a0)
-
-
-class TextPromptWidget(QFrame):
-    """Wraps a single or multi-line text widget, with ability to switch between them.
-    Using QPlainTextEdit set to a single line doesn't work properly because it still
-    scrolls to the next line when eg. selecting and then looks like it's empty."""
-
-    activated = pyqtSignal()
-    text_changed = pyqtSignal(str)
-
-    _line_count = 2
-    _is_negative = False
-
-    def __init__(self, line_count=2, is_negative=False, parent=None):
-        super().__init__(parent)
-        self._line_count = line_count
-        self._is_negative = is_negative
-        self._layout = QVBoxLayout()
-        self._layout.setContentsMargins(0, 0, 0, 0)
-        self.setLayout(self._layout)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        self._multi = MultiLineTextPromptWidget(self)
-        self._multi.line_count = self._line_count
-        self._multi.activated.connect(self.notify_activated)
-        self._multi.textChanged.connect(self.notify_text_changed)
-        self._multi.setVisible(self._line_count > 1)
-
-        self._single = SingleLineTextPromptWidget(self)
-        self._single.textChanged.connect(self.notify_text_changed)
-        self._single.returnPressed.connect(self.notify_activated)
-        self._single.setVisible(self._line_count == 1)
-
-        self._layout.addWidget(self._multi)
-        self._layout.addWidget(self._single)
-
-        palette: QPalette = self._multi.palette()
-        self._base_color = palette.color(QPalette.ColorRole.Base)
-        self.is_negative = self._is_negative
-
-    def notify_text_changed(self):
-        self.text_changed.emit(self.text)
-
-    def notify_activated(self):
-        self.activated.emit()
-
-    @property
-    def text(self):
-        return self._multi.text() if self._line_count > 1 else self._single.text()
-
-    @text.setter
-    def text(self, value: str):
-        if value == self.text:
-            return
-        widget = self._multi if self._line_count > 1 else self._single
-        with SignalBlocker(widget):  # avoid auto-completion on non-user input
-            widget.setText(value)
-
-    @property
-    def line_count(self):
-        return self._line_count
-
-    @line_count.setter
-    def line_count(self, value: int):
-        text = self.text
-        self._line_count = value
-        self.text = text
-        self._multi.setVisible(self._line_count > 1)
-        self._single.setVisible(self._line_count == 1)
-        if self._line_count > 1:
-            self._multi.line_count = self._line_count
+        self.setFixedHeight(fm.lineSpacing() * value + 10)
 
     @property
     def is_negative(self):
@@ -502,42 +501,54 @@ class TextPromptWidget(QFrame):
     @is_negative.setter
     def is_negative(self, value: bool):
         self._is_negative = value
-        for w in (self._multi, self._single):
-            if not value:
-                w.setPlaceholderText(_("Describe the content you want to see, or leave empty."))
-            else:
-                w.setPlaceholderText(_("Describe content you want to avoid."))
+        if not value:
+            self.setPlaceholderText(_("Describe the content you want to see, or leave empty."))
+        else:
+            self.setPlaceholderText(_("Describe content you want to avoid."))
 
         if value:
             self.setContentsMargins(0, 2, 0, 2)
             self.setFrameStyle(QFrame.Shape.StyledPanel)
-            self.setStyleSheet(f"QFrame {{ background: rgba(255, 0, 0, 15); }}")
+            self.setStyleSheet("QFrame { background: rgba(255, 0, 0, 15); }")
         else:
             self.setFrameStyle(QFrame.Shape.NoFrame)
 
     @property
     def has_focus(self):
-        return self._multi.hasFocus() or self._single.hasFocus()
+        return self.hasFocus()
 
     @has_focus.setter
     def has_focus(self, value: bool):
         if value:
-            if self._line_count > 1:
-                self._multi.setFocus()
-            else:
-                self._single.setFocus()
-
-    def install_event_filter(self, obj: QObject):
-        self._multi.installEventFilter(obj)
-        self._single.installEventFilter(obj)
+            self.setFocus()
 
     def move_cursor_to_end(self):
-        if self._line_count > 1:
-            cursor = self._multi.textCursor()
-            cursor.movePosition(QTextCursor.MoveOperation.End)
-            self._multi.setTextCursor(cursor)
-        else:
-            self._single.setCursorPosition(len(self._single.text()))
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.setTextCursor(cursor)
+
+    def handle_weight_adjustment(self, event: QKeyEvent):
+        """Handles Ctrl + (arrow key up / arrow key down) attention weight adjustment."""
+        if event.key() in [Qt.Key.Key_Up, Qt.Key.Key_Down] and (
+            event.modifiers() & Qt.Modifier.CTRL
+        ):
+            cursor = self.textCursor()
+            text = self.toPlainText()
+
+            if cursor.hasSelection():
+                start = cursor.selectionStart()
+                end = cursor.selectionEnd()
+            else:
+                start, end = select_on_cursor_pos(text, cursor.position())
+
+            target_text = text[start:end]
+            text_after_edit = edit_attention(target_text, event.key() == Qt.Key.Key_Up)
+            text = text[:start] + text_after_edit + text[end:]
+            self.setPlainText(text)
+            cursor = self.textCursor()
+            cursor.setPosition(min(start + len(text_after_edit), len(text)))
+            cursor.setPosition(min(start, len(text)), QTextCursor.KeepAnchor)
+            self.setTextCursor(cursor)
 
 
 class StrengthSnapping:
@@ -596,7 +607,7 @@ class StrengthWidget(QWidget):
 
     value_changed = pyqtSignal(float)
 
-    def __init__(self, slider_range: tuple[int, int] = (1, 100), parent=None):
+    def __init__(self, slider_range: tuple[int, int] = (1, 100), prefix=True, parent=None):
         super().__init__(parent)
         self._layout = QHBoxLayout()
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -611,8 +622,10 @@ class StrengthWidget(QWidget):
 
         self._input = StrengthSpinBox(self)
         self._input.setValue(self._value)
-        self._input.setPrefix(_("Strength") + ": ")
+        if prefix:
+            self._input.setPrefix(_("Strength") + ": ")
         self._input.setSuffix("%")
+        self._input.setSpecialValueText(_("Off"))
         self._input.valueChanged.connect(self.notify_changed)
 
         settings.changed.connect(self.update_suffix)
@@ -679,6 +692,7 @@ class WorkspaceSelectWidget(QToolButton):
         Workspace.upscaling: theme.icon("workspace-upscaling"),
         Workspace.live: theme.icon("workspace-live"),
         Workspace.animation: theme.icon("workspace-animation"),
+        Workspace.custom: theme.icon("workspace-custom"),
     }
 
     _value = Workspace.generation
@@ -691,6 +705,7 @@ class WorkspaceSelectWidget(QToolButton):
         menu.addAction(self._create_action(_("Upscale"), Workspace.upscaling))
         menu.addAction(self._create_action(_("Live"), Workspace.live))
         menu.addAction(self._create_action(_("Animation"), Workspace.animation))
+        menu.addAction(self._create_action(_("Graph"), Workspace.custom))
 
         self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         self.setMenu(menu)
@@ -722,23 +737,29 @@ class WorkspaceSelectWidget(QToolButton):
 
 
 class GenerateButton(QPushButton):
-    model: Model
-    operation: str
-    _kind: JobKind
-    _cost: int = 0
-    _cost_icon: QIcon
-
     def __init__(self, kind: JobKind, parent: QWidget):
         super().__init__(parent)
         self.model = root.active_model
-        self.operation = _("Generate")
+        self._operation = _("Generate")
         self._kind = kind
+        self._cost = 0
         self._cost_icon = theme.icon("interstice")
+        self._seed_icon = theme.icon("seed")
+        self._resolution_icon = theme.icon("resolution-multiplier")
         self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    @property
+    def operation(self):
+        return self._operation
+
+    @operation.setter
+    def operation(self, value: str):
+        self._operation = value
+        self.update()
 
     def minimumSizeHint(self):
         fm = self.fontMetrics()
-        return QSize(fm.width(self.operation) + 40, 12 + int(1.3 * fm.height()))
+        return QSize(fm.width(self._operation) + 40, 12 + int(1.3 * fm.height()))
 
     def enterEvent(self, a0: QEvent | None):
         if client := root.connection.client_if_connected:
@@ -755,31 +776,163 @@ class GenerateButton(QPushButton):
         painter = QPainter(self)
         fm = self.fontMetrics()
         style = ensure(self.style())
+        align = (
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignVCenter
+            | Qt.AlignmentFlag.AlignAbsolute
+        )
         rect = self.rect()
         pixmap = self.icon().pixmap(int(fm.height() * 1.3))
         is_hover = int(opt.state) & QStyle.StateFlag.State_MouseOver
         element = QStyle.PrimitiveElement.PE_PanelButtonCommand
-        vcenter = Qt.AlignmentFlag.AlignVCenter
-        content_width = fm.width(self.operation) + 5 + pixmap.width()
+        content_width = fm.width(self._operation) + 5 + pixmap.width()
         content_rect = rect.adjusted(int(0.5 * (rect.width() - content_width)), 0, 0, 0)
         style.drawPrimitive(element, opt, painter, self)
-        style.drawItemPixmap(painter, content_rect, vcenter, pixmap)
+        style.drawItemPixmap(painter, content_rect, align, pixmap)
         content_rect = content_rect.adjusted(pixmap.width() + 5, 0, 0, 0)
-        style.drawItemText(painter, content_rect, vcenter, self.palette(), True, self.operation)
+        style.drawItemText(painter, content_rect, align, self.palette(), True, self._operation)
 
+        cost_width = 0
         if is_hover and self._cost > 0:
-            cost_width = fm.width(str(self._cost))
             pixmap = self._cost_icon.pixmap(fm.height())
-            cost_rect = rect.adjusted(rect.width() - pixmap.width() - cost_width - 16, 0, 0, 0)
+            text_width = fm.width(str(self._cost))
+            cost_width = text_width + 16 + pixmap.width()
+            cost_rect = rect.adjusted(rect.width() - cost_width, 0, 0, 0)
             painter.setOpacity(0.3)
             painter.drawLine(
                 cost_rect.left(), cost_rect.top() + 6, cost_rect.left(), cost_rect.bottom() - 6
             )
             painter.setOpacity(0.7)
             cost_rect = cost_rect.adjusted(6, 0, 0, 0)
-            style.drawItemText(painter, cost_rect, vcenter, self.palette(), True, str(self._cost))
-            cost_rect = cost_rect.adjusted(cost_width + 4, 0, 0, 0)
-            style.drawItemPixmap(painter, cost_rect, vcenter, pixmap)
+            style.drawItemText(painter, cost_rect, align, self.palette(), True, str(self._cost))
+            cost_rect = cost_rect.adjusted(text_width + 4, 0, 0, 0)
+            style.drawItemPixmap(painter, cost_rect, align, pixmap)
+
+        seed_width = 0
+        if is_hover and self.model.fixed_seed:
+            pixmap = self._seed_icon.pixmap(fm.height())
+            seed_width = pixmap.width() + 4
+            seed_rect = rect.adjusted(rect.width() - cost_width - seed_width, 0, 0, 0)
+            style.drawItemPixmap(painter, seed_rect, align, pixmap)
+
+        if is_hover and self.model.resolution_multiplier != 1.0:
+            pixmap = self._resolution_icon.pixmap(fm.height())
+            resolution_rect = rect.adjusted(
+                rect.width() - cost_width - seed_width - pixmap.width() - 4, 0, 0, 0
+            )
+            style.drawItemPixmap(painter, resolution_rect, align, pixmap)
+
+
+class ErrorBox(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._error = no_error
+        self._original_error = ""
+
+        self.setObjectName("errorBox")
+        self.setFrameStyle(QFrame.Shape.StyledPanel)
+
+        self._label = QLabel(self)
+        self._label.setWordWrap(True)
+        self._label.setOpenExternalLinks(True)
+        self._label.setTextFormat(Qt.TextFormat.RichText)
+
+        self._copy_button = QToolButton(self)
+        self._copy_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self._copy_button.setIcon(Krita.instance().icon("edit-copy"))
+        self._copy_button.setToolTip(_("Copy error message to clipboard"))
+        self._copy_button.setAutoRaise(True)
+        self._copy_button.clicked.connect(self._copy_error)
+
+        self._recharge_button = QToolButton(self)
+        self._recharge_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._recharge_button.setText(_("Charge"))
+        self._recharge_button.setIcon(theme.icon("interstice"))
+        self._recharge_button.clicked.connect(self._recharge)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.addWidget(self._label)
+        layout.addWidget(self._copy_button)
+        layout.addWidget(self._recharge_button)
+
+        self.reset()
+
+    def reset(self, color: str = theme.red):
+        self._copy_button.setVisible(False)
+        self._recharge_button.setVisible(False)
+        self._label.setStyleSheet(f"color: {color};")
+        if color == theme.red:
+            self.setStyleSheet("QFrame#errorBox { border: 1px solid #a01020; }")
+        else:
+            self.setStyleSheet(None)
+        self.setVisible(False)
+
+    @property
+    def error(self):
+        return self._error
+
+    @error.setter
+    def error(self, error: Error):
+        self.reset()
+        self._error = error
+        self._original_error = error.message if error else ""
+        if error.kind is ErrorKind.insufficient_funds:
+            self._show_payment_error(error.data)
+        elif error.kind.is_warning:
+            self._show_warning(error.kind, error.message)
+        elif error:
+            self._show_error(error.message)
+
+    def _show_error(self, text: str):
+        if text.count("\n") > 3:
+            lines = text.split("\n")
+            n = 1
+            text = lines[-n]
+            while n < len(lines) and text.strip() == "":
+                n += 1
+                text = lines[-n]
+        if len(text) > 60 * 3:
+            text = text[: 60 * 2] + " [...] " + text[-60:]
+        self._label.setText(text)
+        if text != self._original_error:
+            self._label.setToolTip(self._original_error)
+        self._copy_button.setVisible(True)
+        self.setVisible(True)
+
+    def _show_warning(self, kind: ErrorKind, text: str):
+        self.reset(theme.yellow)
+        if kind is ErrorKind.incompatible_lora:
+            text = (
+                _(
+                    "Selected LoRA model could not be applied. Please make sure it is compatible with the checkpoint base model you are using."
+                )
+                + " <a href='https://docs.interstice.cloud/base-models'>"
+                + _("Learn more")
+                + "</a>"
+            )
+        self._label.setText(text)
+        self.setVisible(True)
+
+    def _show_payment_error(self, data: dict[str, Any] | None):
+        self.reset(theme.yellow)
+        message = "Insufficient funds"
+        if data:
+            message = _(
+                "Insufficient funds - generation would cost {cost} tokens. Remaining tokens: {tokens}",
+                cost=data["cost"],
+                tokens=data["credits"],
+            )
+        self._label.setText(message)
+        self._recharge_button.setVisible(True)
+        self.setVisible(True)
+
+    def _copy_error(self):
+        if clipboard := QGuiApplication.clipboard():
+            clipboard.setText(self._original_error)
+
+    def _recharge(self):
+        QDesktopServices.openUrl(QUrl("https://www.interstice.cloud/user"))
 
 
 def create_wide_tool_button(icon_name: str, text: str, parent=None):
@@ -793,27 +946,35 @@ def create_wide_tool_button(icon_name: str, text: str, parent=None):
     return button
 
 
+def create_framed_label(text: str, parent=None):
+    frame = QFrame(parent)
+    frame.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Plain)
+    label = QLabel(parent=frame)
+    label.setText(text)
+    frame_layout = QHBoxLayout()
+    frame_layout.setContentsMargins(4, 2, 4, 2)
+    frame_layout.addWidget(label)
+    frame.setLayout(frame_layout)
+    return frame, label
+
+
 def _paint_tool_drop_down(widget: QToolButton, text: str | None = None):
     opt = QStyleOption()
     opt.initFrom(widget)
     painter = QPainter(widget)
     style = ensure(widget.style())
+    align = (
+        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignAbsolute
+    )
     rect = widget.rect()
     pixmap = widget.icon().pixmap(int(rect.height() * 0.75))
     element = QStyle.PrimitiveElement.PE_Widget
     if int(opt.state) & QStyle.StateFlag.State_MouseOver:
         element = QStyle.PrimitiveElement.PE_PanelButtonCommand
     style.drawPrimitive(element, opt, painter, widget)
-    style.drawItemPixmap(
-        painter,
-        rect.adjusted(4, 0, 0, 0),
-        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-        pixmap,
-    )
+    style.drawItemPixmap(painter, rect.adjusted(4, 0, 0, 0), align, pixmap)
     if text:
         text_rect = rect.adjusted(pixmap.width() + 4, 0, 0, 0)
-        style.drawItemText(
-            painter, text_rect, Qt.AlignmentFlag.AlignVCenter, widget.palette(), True, text
-        )
+        style.drawItemText(painter, text_rect, align, widget.palette(), True, text)
     painter.translate(int(0.5 * rect.width() - 10), 0)
     style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorArrowDown, opt, painter)

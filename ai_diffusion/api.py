@@ -1,4 +1,4 @@
-from dataclasses import Field, dataclass, field, is_dataclass, fields
+from dataclasses import Field, dataclass, field, is_dataclass, fields, MISSING
 from copy import copy
 from enum import Enum
 from types import GenericAlias, UnionType
@@ -6,7 +6,7 @@ from typing import Any, get_args, get_origin
 import math
 
 from .image import Bounds, Extent, Image, ImageCollection, ImageFileFormat
-from .resources import ControlMode, SDVersion
+from .resources import ControlMode, Arch
 from .util import ensure, clamp
 
 
@@ -18,6 +18,7 @@ class WorkflowKind(Enum):
     upscale_simple = 4
     upscale_tiled = 5
     control_image = 6
+    custom = 7
 
 
 @dataclass
@@ -32,7 +33,6 @@ class ExtentInput:
 class ImageInput:
     extent: ExtentInput
     initial_image: Image | None = None
-    initial_mask: Image | None = None  # deprecated (1.20.0) - hires_mask is scaled during workflow
     hires_image: Image | None = None
     hires_mask: Image | None = None
 
@@ -45,6 +45,7 @@ class ImageInput:
 class LoraInput:
     name: str
     strength: float
+    storage_id: str = ""  # Base64-encoded SHA256 hash
 
     @staticmethod
     def from_dict(data: dict[str, Any]):
@@ -54,12 +55,15 @@ class LoraInput:
 @dataclass
 class CheckpointInput:
     checkpoint: str
-    version: SDVersion = SDVersion.sd15
+    version: Arch = Arch.sd15
     vae: str = ""
     loras: list[LoraInput] = field(default_factory=list)
     clip_skip: int = 0
     v_prediction_zsnr: bool = False
+    rescale_cfg: float = 0.7
     self_attention_guidance: bool = False
+    dynamic_caching: bool = False
+    tiled_vae: bool = False
 
 
 @dataclass
@@ -94,6 +98,7 @@ class RegionInput:
     bounds: Bounds
     positive: str
     control: list[ControlInput] = field(default_factory=list)
+    loras: list[LoraInput] = field(default_factory=list)
 
 
 @dataclass
@@ -144,6 +149,18 @@ class InpaintParams:
 
 
 @dataclass
+class UpscaleInput:
+    model: str = ""  # if empty do tiled refine without upscale model
+    tile_overlap: int = -1
+
+
+@dataclass
+class CustomWorkflowInput:
+    workflow: dict
+    params: dict[str, Any]
+
+
+@dataclass
 class WorkflowInput:
     kind: WorkflowKind
     images: ImageInput | None = None
@@ -152,10 +169,11 @@ class WorkflowInput:
     conditioning: ConditioningInput | None = None
     inpaint: InpaintParams | None = None
     crop_upscale_extent: Extent | None = None
-    upscale_model: str = ""
+    upscale: UpscaleInput | None = None
     control_mode: ControlMode = ControlMode.reference
     batch_count: int = 1
     nsfw_filter: float = 0.0
+    custom_workflow: CustomWorkflowInput | None = None
 
     @property
     def extent(self):
@@ -210,12 +228,12 @@ class WorkflowInput:
         return base + round((10 * cost) / unit)
 
 
-def _base_cost(version: SDVersion):
-    if version is SDVersion.sd15:
+def _base_cost(arch: Arch):
+    if arch is Arch.sd15:
         return 1
-    if version is SDVersion.sdxl:
+    if arch.is_sdxl_like:
         return 2
-    if version is SDVersion.flux:
+    if arch.is_flux_like:
         return 4
     return 1
 
@@ -283,8 +301,12 @@ class Deserializer:
         return type(*values)
 
     def _field(self, field: Field, value):
-        if value is None:
+        if value is None and field.default is not MISSING:
             return field.default
+        elif value is None and field.default_factory is not MISSING:
+            return field.default_factory()
+        elif value is None:
+            return None
         field_type = field.type
         if isinstance(field_type, UnionType):
             field_type = get_args(field_type)[0]

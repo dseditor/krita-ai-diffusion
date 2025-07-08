@@ -4,13 +4,12 @@ from PyQt5.QtCore import QObject, pyqtSignal, QUrl
 from PyQt5.QtGui import QDesktopServices
 import asyncio
 
-from .client import Client, ClientMessage, ClientEvent, DeviceInfo
+from .client import Client, ClientMessage, ClientEvent, DeviceInfo, SharedWorkflow, MissingResources
 from .comfy_client import ComfyClient
 from .cloud_client import CloudClient
 from .network import NetworkError
 from .settings import Settings, ServerMode, PerformancePreset, settings
 from .properties import Property, ObservableProperties
-from .resources import MissingResource
 from .localization import translate as _
 from . import util, eventloop
 
@@ -30,18 +29,22 @@ class ConnectionState(Enum):
 class Connection(QObject, ObservableProperties):
     state = Property(ConnectionState.disconnected)
     error = Property("")
-    missing_resource: MissingResource | None = None
 
     state_changed = pyqtSignal(ConnectionState)
     error_changed = pyqtSignal(str)
     models_changed = pyqtSignal()
     message_received = pyqtSignal(ClientMessage)
-
-    _client: Client | None = None
-    _task: asyncio.Task | None = None
+    workflow_published = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
+
+        self._client: Client | None = None
+        self._task: asyncio.Task | None = None
+        self._workflows: dict[str, dict] = {}
+        self._temporary_disconnect = False
+        self.missing_resources: MissingResources | None = None
+
         settings.changed.connect(self._handle_settings_changed)
         self._update_state()
 
@@ -73,8 +76,7 @@ class Connection(QObject, ObservableProperties):
     async def _connect(self, url: str, mode: ServerMode, access_token=""):
         if self.state is ConnectionState.connected:
             await self.disconnect()
-        self.error = None
-        self.missing_resource = None
+        self.error = ""
         self.state = ConnectionState.connecting
         try:
             if mode is ServerMode.cloud:
@@ -84,24 +86,25 @@ class Connection(QObject, ObservableProperties):
                 self._client = await CloudClient.connect(CloudClient.default_api_url, access_token)
             else:
                 self._client = await ComfyClient.connect(url)
+                self.missing_resources = self._client.missing_resources
 
             apply_performance_preset(settings, self._client.device_info)
             if self._task is None:
                 self._task = eventloop._loop.create_task(self._handle_messages())
             self.state = ConnectionState.connected
             self.models_changed.emit()
-        except MissingResource as e:
-            self.error = (
-                _("Connection established, but the server is missing one or more ") + e.kind.value
-            )
-            self.missing_resource = e
-            self.state = ConnectionState.error
         except NetworkError as e:
             self.error = e.message
             self.state = ConnectionState.error
             if e.status == 401:  # Unauthorized
                 settings.access_token = ""
                 self._update_state()
+        except MissingResources as e:
+            self.error = _(
+                "Connection established, but the server is missing required custom nodes or models."
+            )
+            self.missing_resources = e
+            self.state = ConnectionState.error
         except Exception as e:
             self.error = util.log_error(e)
             self.state = ConnectionState.error
@@ -118,8 +121,8 @@ class Connection(QObject, ObservableProperties):
             self._task = None
 
         self._client = None
-        self.error = None
-        self.missing_resource = None
+        self.error = ""
+        self.missing_resources = None
         self.state = ConnectionState.disconnected
         self._update_state()
 
@@ -151,32 +154,45 @@ class Connection(QObject, ObservableProperties):
         if client := self.client_if_connected:
             return client.user
 
+    @property
+    def workflows(self):
+        return self._workflows
+
     async def _handle_messages(self):
         client = self._client
-        temporary_disconnect = False
+        self._temporary_disconnect = False
         assert client is not None
 
         try:
-            async for msg in client.listen():
-                try:
-                    if msg.event is ClientEvent.error and not msg.job_id:
-                        self.error = _("Error communicating with server: ") + str(msg.error)
-                    elif msg.event is ClientEvent.disconnected:
-                        temporary_disconnect = True
-                        self.error = _("Disconnected from server, trying to reconnect...")
-                    elif msg.event is ClientEvent.connected:
-                        if temporary_disconnect:
-                            temporary_disconnect = False
-                            self.error = ""
-                    else:
-                        self.message_received.emit(msg)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    util.client_logger.exception(e)
-                    self.error = _("Error handling server message: ") + str(e)
+            async with client:
+                async for msg in client.listen():
+                    try:
+                        self._handle_message(msg)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        util.client_logger.exception(e)
+                        self.error = _("Error handling server message: ") + str(e)
         except asyncio.CancelledError:
             pass  # shutdown
+
+    def _handle_message(self, msg: ClientMessage):
+        match msg:
+            case (ClientEvent.error, "", *_):
+                self.error = _("Error communicating with server: ") + str(msg.error)
+            case (ClientEvent.disconnected, *_):
+                self._temporary_disconnect = True
+                self.error = _("Disconnected from server, trying to reconnect...")
+            case (ClientEvent.connected, *_):
+                if self._temporary_disconnect:
+                    self._temporary_disconnect = False
+                    self.error = ""
+            case (ClientEvent.published, *_):
+                assert isinstance(msg.result, SharedWorkflow)
+                self._workflows[msg.result.publisher] = msg.result.workflow
+                self.workflow_published.emit(msg.result.publisher)
+            case _:
+                self.message_received.emit(msg)
 
     def _update_state(self):
         if (

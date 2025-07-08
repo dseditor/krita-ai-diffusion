@@ -60,7 +60,12 @@ The easiest way to run a development version of the plugin is to use symlinks:
 
 ### Code formatting
 
-The codebase uses [black](https://github.com/psf/black) for formatting. You can check locally by running `black` in the repository root, or use an IDE integration.
+The codebase uses [ruff](https://docs.astral.sh/ruff/) for linting. You can
+use an IDE integration, or check locally by running in the repository root:
+```
+ruff format
+ruff check
+```
 
 ### Code style
 
@@ -74,16 +79,21 @@ The `Krita` module is special in that it is usually only available when running 
 
 You can run `pyright` from the repository root to perform type checks on the entire codebase. This is also done by the CI.
 
-Configuration for VSCode with Pylance (.vscode/settings.json):
-```
-{
-  "python.analysis.typeCheckingMode": "basic",
-  "python.analysis.exclude": [
-    "scripts/typeshed/**",
-    "ai_diffusion/websockets/**"
-  ]
-}
-```
+### Debug
+
+The project includes a `launch.json` for VSCode which is configured to attach to
+a running Krita process. This allows to use the visual debugger for exceptions,
+breakpoints, inspecting and stepping through the code. Start debugging via the
+"Run and Debug" tab (F5).
+
+The way it works is:
+1. `debugpy` is added to the `ai_diffusion` folder as a git submodule to make it
+   available inside Krita's embedded Python
+1. `extension.py` starts a debug server if the `debugpy` module is present
+   (skipped for release deployments)
+2. VSCode (or more generally any `debugpy` client) attaches to the server
+
+You can also add breakpoints inside the code with `import debugpy; debugpy.breakpoint()`.
 
 ### Tests
 
@@ -100,7 +110,7 @@ pytest tests
 Some tests require a running ComfyUI server. This should be automated... but for now it's not.
 
 ### What is tested
-Generating images is tested. Because it takes a lot of time the number of tests is limited. Because it's very random, images are not compared (but this can be solved with consistent installation and fixed seeds).
+Generating images is tested. Because it takes a lot of time the number of tests is limited. Images are not compared in most cases, as they tend to frequently change with updates to dependencies.
 
 Functionality which uses Krita's API is _not_ tested. It just doesn't work outside Krita without a comprehensive mock.
 
@@ -125,5 +135,3 @@ You can also run the file server manually. Then you can start Krita with the `HO
 python scripts/file_server.py
 
 HOSTMAP=1 /your/krita/install/krita
-```
-Note that the mock file server likes to transmit corrupted files if they are very large (eg. SDXL checkpoint)... not sure why (?)

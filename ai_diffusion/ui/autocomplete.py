@@ -1,16 +1,15 @@
 from enum import Enum
 from dataclasses import dataclass
 import csv
-from pathlib import Path
-from typing import cast, List
+from typing import cast
 
-from PyQt5.QtWidgets import QApplication, QCompleter, QLineEdit, QStyledItemDelegate, QStyle
-from PyQt5.QtGui import QFont, QPainter, QPalette, QPen, QColor, QFontMetrics
+from PyQt5.QtWidgets import QApplication, QCompleter, QPlainTextEdit, QStyledItemDelegate, QStyle
+from PyQt5.QtGui import QFont, QPalette, QPen, QColor, QFontMetrics, QTextCursor
 from PyQt5.QtCore import Qt, QStringListModel, QSize, QRect, QAbstractProxyModel
 
 from ..root import root
 from ..settings import settings
-from ..text import LoraId
+from ..files import FileFilter
 from ..util import ensure, plugin_dir, user_data_dir
 
 
@@ -38,6 +37,14 @@ class TagListModel(QStringListModel):
     def setTags(self, tags):
         self.tags = tags
         super().setStringList([tag.tag for tag in tags])
+
+
+def cursor_position(text: str, cursor: QTextCursor):
+    pos_c16 = cursor.position()  # counted as 2-byte characters
+    bytes_utf16 = text.encode("utf-16")
+    byte_pos = 2 + pos_c16 * 2  # utf-16 text starts with 2-byte BOM
+    text_until_pos = bytes_utf16[:byte_pos].decode("utf-16")
+    return len(text_until_pos)
 
 
 class TagCompleterDelegate(QStyledItemDelegate):
@@ -134,12 +141,7 @@ _tag_files = None
 
 
 class PromptAutoComplete:
-    _completer: QCompleter
-    _completion_prefix: str
-    _completion_suffix: str
-    _lora_model: QStringListModel | None
-
-    def __init__(self, widget: QLineEdit):
+    def __init__(self, widget: QPlainTextEdit):
         self._widget = widget
         self._completer = QCompleter()
         self._completer.activated.connect(self._insert_completion)
@@ -152,15 +154,11 @@ class PromptAutoComplete:
         self._completion_prefix = ""
         self._completion_suffix = ""
 
-        self._refresh_loras()
-        root.connection.state_changed.connect(self._refresh_loras)
+        self._lora_model = FileFilter(root.files.loras)
+        self._lora_model.available_only = True
+
         self._reload_tag_model()
         settings.changed.connect(self._reload_tag_model)
-
-    def _refresh_loras(self):
-        if client := root.connection.client_if_connected:
-            loras = [LoraId.normalize(lora).name for lora in client.models.loras]
-            self._lora_model = QStringListModel(loras)
 
     def _reload_tag_model(self):
         global _tag_model
@@ -184,19 +182,21 @@ class PromptAutoComplete:
 
             with tag_path.open("r", encoding="utf-8") as f:
                 csv_reader = csv.reader(f)
-                # skip header line
-                next(csv_reader)
                 for tag, type_str, count, _aliases in csv_reader:
-                    tag = tag.replace("_", " ")
-                    tag_type = TagType(int(type_str))
-                    count = int(count)
-                    count_str = str(count)
-                    if count > 1_000_000:
-                        count_str = f"{count/1_000_000:.0f}m"
-                    elif count > 1_000:
-                        count_str = f"{count/1_000:.0f}k"
-                    meta = f"{tag_name} {count_str}"
-                    all_tags.append(TagItem(tag, tag_type, count, meta))
+                    if type_str.isdigit():  # skip header rows if they exist
+                        tag = tag.replace("_", " ")
+                        try:
+                            tag_type = TagType(int(type_str))
+                        except Exception:  # default to general category if category unrecognised
+                            tag_type = TagType(0)
+                        count = int(count)
+                        count_str = str(count)
+                        if count > 1_000_000:
+                            count_str = f"{count / 1_000_000:.0f}m"
+                        elif count > 1_000:
+                            count_str = f"{count / 1_000:.0f}k"
+                        meta = f"{tag_name} {count_str}"
+                        all_tags.append(TagItem(tag, tag_type, count, meta))
 
         sorted_tags = sorted(all_tags, key=lambda x: x.count, reverse=True)
         seen = set()
@@ -206,8 +206,8 @@ class PromptAutoComplete:
         _tag_files = tag_files
 
     def _current_text(self, separators=" >\n") -> str:
-        text = self._widget.text()
-        start = pos = self._widget.cursorPosition()
+        text = self._widget.toPlainText()
+        start = pos = cursor_position(text, self._widget.textCursor())
         while pos > 0 and (text[pos - 1] not in separators or pos > 1 and text[pos - 2] == "\\"):
             pos -= 1
         return text[pos:start]
@@ -217,16 +217,16 @@ class PromptAutoComplete:
         name = prefix.removeprefix("<lora:")
         lora_mode = len(prefix) > len(name)
 
-        if lora_mode and self._lora_model:
+        if lora_mode:
             self._completer.setModel(self._lora_model)
             self._completion_prefix = name
             self._completion_suffix = ">"
             self._popup.setItemDelegate(self._lora_delegate)
         else:
             # fall through to tag search
-            self._completion_prefix = prefix = self._current_text(separators="()>,\n").strip()
+            self._completion_prefix = prefix = self._current_text(separators="()>,\n").lstrip()
             name = prefix.replace("\\(", "(").replace("\\)", ")")
-            if not name.startswith("<") and len(name) > 2:
+            if not name.startswith("<") and len(name.rstrip()) > 2:
                 self._completer.setModel(_tag_model)
                 self._popup.setItemDelegate(TagCompleterDelegate())
                 self._completion_suffix = ""
@@ -241,15 +241,24 @@ class PromptAutoComplete:
         self._completer.complete(rect)
 
     def _insert_completion(self, completion):
-        completion = completion.replace("(", "\\(").replace(")", "\\)")
-        text = self._widget.text()
-        pos = self._widget.cursorPosition()
-        prefix_len = len(self._completion_prefix)
-        text = text[: pos - prefix_len] + completion + self._completion_suffix + text[pos:]
-        self._widget.setText(text)
-        self._widget.setCursorPosition(
-            pos - prefix_len + len(completion) + len(self._completion_suffix)
-        )
+        triggers = ""
+        if self._current_text().startswith("<lora:"):
+            if file := root.files.loras.find(f"{completion}.safetensors"):
+                triggers = " " + file.meta("lora_triggers", "")
+        else:  # tag completion
+            # escape () in tags so they won't be interpreted as prompt weights
+            completion = completion.replace("(", "\\(").replace(")", "\\)")
+        text = self._widget.toPlainText()
+        initial_cursor = self._widget.textCursor()
+        pos = cursor_position(text, initial_cursor)
+        start_pos = pos - len(self._completion_prefix)  # pos in python string
+        start_cursor_pos = initial_cursor.position() - len(self._completion_prefix)  # pos in utf-16
+        fill = completion + self._completion_suffix + triggers
+        text = text[:start_pos] + fill + text[pos:]
+        self._widget.setPlainText(text)
+        cursor = self._widget.textCursor()
+        cursor.setPosition(start_cursor_pos + len(fill))
+        self._widget.setTextCursor(cursor)
 
     @property
     def is_active(self):

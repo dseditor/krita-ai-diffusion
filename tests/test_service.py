@@ -7,15 +7,15 @@ import asyncio
 import dotenv
 
 from ai_diffusion.api import WorkflowInput, WorkflowKind, ControlInput, ImageInput, CheckpointInput
-from ai_diffusion.api import SamplingInput, ConditioningInput, ExtentInput
+from ai_diffusion.api import SamplingInput, ConditioningInput, ExtentInput, RegionInput
 from ai_diffusion.client import Client, ClientEvent
-from ai_diffusion.cloud_client import CloudClient
-from ai_diffusion.image import Extent, Image
-from ai_diffusion.resources import ControlMode, SDVersion
+from ai_diffusion.cloud_client import CloudClient, enumerate_features, apply_limits
+from ai_diffusion.image import Extent, Image, Bounds
+from ai_diffusion.resources import ControlMode, Arch
 from ai_diffusion.util import ensure
+from .conftest import has_local_cloud
 from .config import root_dir, test_dir, result_dir
 
-dotenv.load_dotenv(root_dir / "service" / "web" / ".env.local")
 pod_main = root_dir / "service" / "pod" / "pod.py"
 run_dir = test_dir / "pod"
 
@@ -78,6 +78,9 @@ async def receive_images(client: Client, work: WorkflowInput):
 def cloud_client(pytestconfig, qtapp, pod_server):
     if pytestconfig.getoption("--ci"):
         pytest.skip("Diffusion is disabled on CI")
+    if not has_local_cloud:
+        pytest.skip("Local cloud service not found")
+    dotenv.load_dotenv(root_dir / "service" / "web" / ".env.local")
     url = os.environ["TEST_SERVICE_URL"]
     token = os.environ["TEST_SERVICE_TOKEN"]
     return qtapp.run(CloudClient.connect(url, token))
@@ -131,38 +134,36 @@ def test_large_image(qtapp, cloud_client):
     run_and_save(qtapp, cloud_client, workflow, "pod_large_image")
 
 
-@pytest.mark.parametrize("scenario", ["resolution", "steps", "control", "max_pixels"])
+@pytest.mark.parametrize("scenario", ["resolution", "steps", "max_pixels"])
 def test_validation(qtapp, cloud_client: CloudClient, scenario: str):
     workflow = create_simple_workflow()
     if scenario == "resolution":
-        workflow.images = ImageInput.from_extent(Extent(9000, 512))
+        workflow.images = ImageInput.from_extent(Extent(19000, 512))
     elif scenario == "steps":
         ensure(workflow.sampling).total_steps = 200
-    elif scenario == "control":
-        img = Image.create(Extent(4, 4))
-        control = ensure(workflow.conditioning).control
-        for i in range(7):
-            control.append(ControlInput(ControlMode.depth, img))
     elif scenario == "max_pixels":
         workflow.images = ImageInput.from_extent(Extent(3840, 2168))  # > 4k
 
-    with pytest.raises(Exception, match="Validation error"):
+    expected = "Image size" if scenario == "resolution" else "Validation error"
+    with pytest.raises(Exception, match=expected):
         run_and_save(qtapp, cloud_client, workflow, "pod_validation")
 
 
 cost_params = {
-    "sd15-live-512x512": (SDVersion.sd15, 1, 512, 512, 1),
-    "sd15-8x512x512": (SDVersion.sd15, 8, 512, 512, 20),
-    "sd15-2x1024x1024": (SDVersion.sd15, 2, 1024, 1024, 20),
-    "sd15-1x1024x2048": (SDVersion.sd15, 1, 1024, 2048, 20),
-    "sdxl-2x1024x1024": (SDVersion.sdxl, 2, 1024, 1024, 20),
-    "sdxl-highstep": (SDVersion.sdxl, 1, 1536, 1024, 50),
-    "sdxl-refine": (SDVersion.sdxl, 1, 1536, 1024, 20),
-    "inpaint-initial": (SDVersion.sdxl, 2, 1024, 1024, 24),
-    "inpaint-crop": (SDVersion.sd15, 2, 512, 512, 24),
-    "upscale-tiled": (SDVersion.sd15, 1, 512, 512, 10),
-    "upscale-tiled-2": (SDVersion.sd15, 1, 320, 640, 10),
-    "upscaled-invalid": (SDVersion.sd15, 1, 512, 512, 10),
+    "sd15-live-512x512": (Arch.sd15, 1, 512, 512, 1),
+    "sd15-8x512x512": (Arch.sd15, 8, 512, 512, 20),
+    "sd15-2x1024x1024": (Arch.sd15, 2, 1024, 1024, 20),
+    "sd15-1x1024x2048": (Arch.sd15, 1, 1024, 2048, 20),
+    "sdxl-2x1024x1024": (Arch.sdxl, 2, 1024, 1024, 20),
+    "sdxl-highstep": (Arch.sdxl, 1, 1536, 1024, 50),
+    "sdxl-refine": (Arch.sdxl, 1, 1536, 1024, 20),
+    "inpaint-initial": (Arch.sdxl, 2, 1024, 1024, 24),
+    "inpaint-crop": (Arch.sd15, 2, 512, 512, 24),
+    "upscale-tiled": (Arch.sd15, 1, 512, 512, 10),
+    "upscale-tiled-2": (Arch.sd15, 1, 320, 640, 10),
+    "upscaled-invalid": (Arch.sd15, 1, 512, 512, 10),
+    "illustrious": (Arch.illu, 2, 1024, 1024, 20),
+    "illustrious-v": (Arch.illu_v, 2, 1024, 1024, 20),
 }
 
 
@@ -201,3 +202,26 @@ def test_compute_cost(qtapp, cloud_client: CloudClient, params):
         assert service_cost == input.cost
 
     qtapp.run(check())
+
+
+def test_features_limits():
+    features = enumerate_features({"max_control_layers": 2})
+    image = Image.create(Extent(4, 4))
+    control_layers = [
+        ControlInput(ControlMode.blur, image),
+        ControlInput(ControlMode.line_art, image),
+        ControlInput(ControlMode.depth, image),
+    ]
+    work = WorkflowInput(
+        WorkflowKind.generate,
+        models=CheckpointInput("ckpt", self_attention_guidance=True),
+        conditioning=ConditioningInput(
+            "prompt",
+            control=control_layers,
+            regions=[RegionInput(image, Bounds(0, 0, 4, 4), "positive", control_layers)],
+        ),
+    )
+    apply_limits(work, features)
+    assert work.conditioning and len(work.conditioning.control) == 2
+    assert work.conditioning and len(work.conditioning.regions[0].control) == 2
+    assert work.models and work.models.self_attention_guidance is False

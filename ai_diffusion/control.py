@@ -7,9 +7,9 @@ import json
 from . import model, jobs, resources, util
 from .api import ControlInput
 from .layer import Layer, LayerType
-from .resources import ControlMode, ResourceKind, SDVersion
+from .resources import ControlMode, ResourceKind, Arch, resource_id
 from .properties import Property, ObservableProperties
-from .image import Bounds
+from .image import Bounds, Extent, Image
 from .localization import translate as _
 from .util import client_logger as log
 
@@ -17,6 +17,7 @@ from .util import client_logger as log
 class ControlLayer(QObject, ObservableProperties):
     max_preset_value = 4
     strength_multiplier = 50
+    clip_vision_extent = Extent(224, 224)
 
     mode = Property(ControlMode.reference, persist=True, setter="set_mode")
     layer_id = Property(QUuid(), persist=True)
@@ -45,14 +46,13 @@ class ControlLayer(QObject, ObservableProperties):
     error_text_changed = pyqtSignal(str)
     modified = pyqtSignal(QObject, str)
 
-    _model: model.Model
-    _generate_job: jobs.Job | None = None
-
-    def __init__(self, model: model.Model, mode: ControlMode, layer_id: QUuid):
+    def __init__(self, model: model.Model, mode: ControlMode, layer_id: QUuid, index: int):
         from .root import root
 
         super().__init__()
         self._model = model
+        self._index = index
+        self._generate_job: jobs.Job | None = None
         self.layer_id = layer_id
         self.mode = mode
         self._update_is_supported()
@@ -85,7 +85,7 @@ class ControlLayer(QObject, ObservableProperties):
 
     def _set_values_from_preset(self):
         params = ControlPresets.instance().interpolate(
-            self.mode, self._model.sd_version, self.preset_value / self.max_preset_value
+            self.mode, self._model.arch, self.preset_value / self.max_preset_value
         )
         self.strength = int(params.strength * self.strength_multiplier)
         self.start, self.end = params.range
@@ -97,14 +97,34 @@ class ControlLayer(QObject, ObservableProperties):
             if not value:
                 self._set_values_from_preset()
 
+    @property
+    def index(self):
+        return self._index
+
+    @index.setter
+    def index(self, index: int):
+        self._index = index
+        self._update_is_supported()
+
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         assert self.is_supported, "Control layer is not supported"
+        extent = bounds.extent if bounds else self._model.document.extent
         layer = self.layer
         if self.mode.is_ip_adapter and not layer.bounds.is_zero:
             bounds = None  # ignore mask bounds, use layer bounds
+
         image = layer.get_pixels(bounds, time)
+
         if self.mode.is_lines or self.mode is ControlMode.stencil:
             image.make_opaque(background=Qt.GlobalColor.white)
+
+        if self._model.arch.is_edit:
+            if image.extent.height > extent.height:
+                w = (image.extent.width * extent.height) // image.extent.height
+                image = Image.scale(image, Extent(w, extent.height))
+        elif self.mode.is_ip_adapter:
+            image = Image.scale(image, self.clip_vision_extent)
+
         strength = self.strength / self.strength_multiplier
         return ControlInput(self.mode, image, strength, (self.start, self.end))
 
@@ -117,26 +137,49 @@ class ControlLayer(QObject, ObservableProperties):
 
         is_supported = True
         if client := root.connection.client_if_connected:
-            models = client.models.for_checkpoint(self._model.style.sd_checkpoint)
-            if self.mode.is_ip_adapter and models.ip_adapter.find(self.mode) is None:
-                self.error_text = (
-                    _("The server is missing the IP-Adapter model") + f" {self.mode.text}"
-                )
-                if not client.supports_ip_adapter:
+            models = client.models.for_arch(self._model.arch)
+            if self.mode.is_ip_adapter and models.arch in [Arch.illu, Arch.illu_v]:
+                resid = resource_id(ResourceKind.clip_vision, Arch.illu, "ip_adapter")
+                has_clip_vision = client.models.resources.get(resid, None) is not None
+                if not has_clip_vision:
+                    search = resources.search_path(
+                        ResourceKind.clip_vision, Arch.illu, "ip_adapter"
+                    )
+                    self.error_text = _("The server is missing the ClipVision model") + f" {search}"
+                    is_supported = False
+
+            if self.mode.is_ip_adapter and models.arch is Arch.flux_k:
+                is_supported = True  # Reference images are merged into the conditioning context
+            elif self.mode.is_ip_adapter and models.ip_adapter.find(self.mode) is None:
+                search_path = resources.search_path(ResourceKind.ip_adapter, models.arch, self.mode)
+                if search_path:
+                    self.error_text = (
+                        _("The server is missing the IP-Adapter model") + f" {self.mode.text}"
+                    )
+                else:
+                    self.error_text = _("Not supported for") + f" {models.arch.value}"
+                if not client.features.ip_adapter:
                     self.error_text = _("IP-Adapter is not supported by this GPU")
                 is_supported = False
             elif self.mode.is_control_net:
-                if models.control.find(self.mode, allow_universal=True) is None:
+                cn_model = models.control.find(self.mode, allow_universal=True)
+                lora_model = models.lora.find(self.mode)
+                if cn_model is None and lora_model is None:
+                    search_arch = Arch.illu if models.arch is Arch.illu_v else models.arch
                     search_path = resources.search_path(
-                        ResourceKind.controlnet, models.version, self.mode
-                    )
+                        ResourceKind.controlnet, search_arch, self.mode
+                    ) or resources.search_path(ResourceKind.lora, models.arch, self.mode)
                     if search_path:
                         self.error_text = (
                             _("The ControlNet model is not installed") + f" {search_path}"
                         )
                     else:
-                        self.error_text = _("Not supported for") + f" {models.version.value}"
+                        self.error_text = _("Not supported for") + f" {models.arch.value}"
                     is_supported = False
+
+            if self._index >= client.features.max_control_layers:
+                self.error_text = _("Too many control layers")
+                is_supported = False
 
         self.is_supported = is_supported
         self.can_generate = is_supported and self.mode.has_preprocessor
@@ -178,7 +221,8 @@ class ControlLayerList(QObject):
         if layer is None:  # shouldn't be possible, Krita doesn't allow removing all non-mask layers
             log.warning("Trying to add control layer, but document has no suitable layer")
             return
-        control = ControlLayer(self._model, self._last_mode, layer.id)
+        mode = ControlMode.reference if self._model.arch.is_edit else self._last_mode
+        control = ControlLayer(self._model, mode, layer.id, len(self._layers))
         control.mode_changed.connect(self._update_last_mode)
         self._layers.append(control)
         self.added.emit(control)
@@ -190,6 +234,9 @@ class ControlLayerList(QObject):
     def remove(self, control: ControlLayer):
         self._layers.remove(control)
         self.removed.emit(control)
+
+        for i, c in enumerate(self._layers):
+            c.index = i
 
     def to_api(self, bounds: Bounds | None = None, time: int | None = None):
         for layer in (c for c in self._layers if not c.is_supported):
@@ -240,18 +287,18 @@ class ControlPresets:
         self._user_path = util.user_data_dir / "presets" / "control.json"
         self._read()
 
-    def get(self, mode: ControlMode, version: SDVersion):
+    def get(self, mode: ControlMode, arch: Arch):
         default = self._presets["default"]
         versions = self._presets.get(mode.name, default)
         all = versions.get("all", None)
-        presets = versions.get(version.name, all)
+        presets = versions.get(arch.name, all)
         if presets is None:
-            raise KeyError(f"No control strength presets found for {mode} and {version}")
+            raise KeyError(f"No control strength presets found for {mode} and {arch}")
         return [ControlParams.from_dict(p) for p in presets]
 
-    def interpolate(self, mode: ControlMode, version: SDVersion, value: float):
+    def interpolate(self, mode: ControlMode, arch: Arch, value: float):
         assert value >= 0 and value <= 1, f"Interpolate value out of range: {value}"
-        presets = self.get(mode, version)
+        presets = self.get(mode, arch)
         if len(presets) == 1 or value <= 0:
             return presets[0]
         if value == 1:
@@ -265,7 +312,7 @@ class ControlPresets:
                     _lerp(p0.strength, p1.strength, t),
                     (_lerp(p0.range[0], p1.range[0], t), _lerp(p0.range[1], p1.range[1], t)),
                 )
-        assert False, f"Interpolation failed: {mode}, {version}, value={value}, presets={presets}"
+        assert False, f"Interpolation failed: {mode}, {arch}, value={value}, presets={presets}"
 
     def _read(self):
         self._presets = self._read_file(self._path)
@@ -287,7 +334,7 @@ class ControlPresets:
 
 def _validate_presets(filepath: Path, data: dict[str, Any]) -> bool:
     control_modes = ["default"] + list(ControlMode.__members__.keys())
-    sd_versions = list(SDVersion.__members__.keys())
+    model_archs = list(Arch.__members__.keys())
 
     for mode, versions in data.items():
         if mode not in control_modes:
@@ -299,23 +346,23 @@ def _validate_presets(filepath: Path, data: dict[str, Any]) -> bool:
         if not isinstance(versions, dict):
             log.error(f"Invalid presets for mode '{mode}' in presets file {filepath}.")
             return False
-        for version, presets in versions.items():
-            if version not in sd_versions:
+        for arch, presets in versions.items():
+            if arch not in model_archs:
                 log.error(
-                    f"Invalid SD version '{version}' for mode '{mode}' in presets file {filepath}."
-                    f" Valid versions are: {', '.join(sd_versions)}"
+                    f"Invalid Base model '{arch}' for mode '{mode}' in presets file {filepath}."
+                    f" Valid versions are: {', '.join(model_archs)}"
                 )
                 return False
             if not isinstance(presets, list):
                 log.error(
-                    f"Invalid presets for '{mode}/{version}' in presets file {filepath}."
+                    f"Invalid presets for '{mode}/{arch}' in presets file {filepath}."
                     f" Expected a list, got {presets}"
                 )
                 return False
             for p in presets:
                 if not isinstance(p, dict) or not all(k in p for k in ("strength", "start", "end")):
                     log.error(
-                        f"Invalid preset for '{mode}/{version}' in presets file {filepath}."
+                        f"Invalid preset for '{mode}/{arch}' in presets file {filepath}."
                         f" Expected a {{strength, start, end}}, got {p}"
                     )
                     return False

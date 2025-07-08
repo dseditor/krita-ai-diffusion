@@ -1,15 +1,17 @@
 from __future__ import annotations
 from enum import Enum
 from itertools import chain
+import json
+import hashlib
 from pathlib import Path
-from typing import NamedTuple, Sequence
+from typing import Any, NamedTuple, Sequence
 
 # Version identifier for all the resources defined here. This is used as the server version.
 # It usually follows the plugin version, but not all new plugin versions also require a server update.
-version = "1.23.0"
+version = "1.36.0"
 
 comfy_url = "https://github.com/comfyanonymous/ComfyUI"
-comfy_version = "413322645e713bdda69836620a97d4c9ca66b230"
+comfy_version = "e18f53cca9062cc6b165e16712772437b80333f2"
 
 
 class CustomNode(NamedTuple):
@@ -25,109 +27,162 @@ required_custom_nodes = [
         "ControlNet Preprocessors",
         "comfyui_controlnet_aux",
         "https://github.com/Fannovel16/comfyui_controlnet_aux",
-        "6f1ba1c10df84af6d356119ccf4ebcf796a10e1c",
+        "83463c2e4b04e729268e57f638b4212e0da4badc",
         ["InpaintPreprocessor", "DepthAnythingV2Preprocessor"],
     ),
     CustomNode(
         "IP-Adapter",
         "ComfyUI_IPAdapter_plus",
         "https://github.com/cubiq/ComfyUI_IPAdapter_plus",
-        "78ac59c61c8caf33e3419d2c8f70838b2da0fb04",
+        "b188a6cb39b512a9c6da7235b880af42c78ccd0d",
         ["IPAdapterModelLoader", "IPAdapter"],
     ),
     CustomNode(
         "External Tooling Nodes",
         "comfyui-tooling-nodes",
         "https://github.com/Acly/comfyui-tooling-nodes",
-        "b5fec4a0625e47586b7b28585ce27d4ecdd3b18a",
+        "5ef2fddc1ba5fc2dc38286a29f97268be4e25343",
         ["ETN_LoadImageBase64", "ETN_LoadMaskBase64", "ETN_SendImageWebSocket", "ETN_Translate"],
     ),
     CustomNode(
         "Inpaint Nodes",
         "comfyui-inpaint-nodes",
         "https://github.com/Acly/comfyui-inpaint-nodes",
-        "48a8913b584b25db8a9c529be84929be66b1194e",
+        "b9039c22de926919f26b7242cfa4da00d8b6fbec",
         ["INPAINT_LoadFooocusInpaint", "INPAINT_ApplyFooocusInpaint", "INPAINT_ExpandMask"],
     ),
 ]
 
+optional_custom_nodes = [
+    CustomNode(
+        "GGUF",
+        "ComfyUI-GGUF",
+        "https://github.com/city96/ComfyUI-GGUF",
+        "a2b75978fd50c0227a58316619b79d525b88e570",
+        ["UnetLoaderGGUF", "DualCLIPLoaderGGUF"],
+    ),
+    CustomNode(
+        "WaveSpeed",
+        "Comfy-WaveSpeed",
+        "https://github.com/chengzeyi/Comfy-WaveSpeed",
+        "16ec6f344f8cecbbf006d374043f85af22b7a51d",
+        ["ApplyFBCacheOnModel"],
+    ),
+]
 
-class SDVersion(Enum):
+
+class Arch(Enum):
+    """Diffusion model architectures."""
+
     sd15 = "SD 1.5"
     sdxl = "SD XL"
     sd3 = "SD 3"
     flux = "Flux"
+    flux_k = "Flux Kontext"
+    illu = "Illustrious"
+    illu_v = "Illustrious v-prediction"
 
     auto = "Automatic"
     all = "All"
 
     @staticmethod
-    def from_string(string: str):
+    def from_string(string: str, model_type: str = "eps", filename: str | None = None):
         if string == "sd15":
-            return SDVersion.sd15
-        if string == "sdxl":
-            return SDVersion.sdxl
+            return Arch.sd15
+        if string == "sdxl" and model_type == "v-prediction":
+            return Arch.illu_v
+        elif string == "sdxl":
+            return Arch.sdxl
         if string == "sd3":
-            return SDVersion.sd3
+            return Arch.sd3
+        if string == "flux" and filename and "kontext" in filename.lower():
+            return Arch.flux_k
         if string == "flux" or string == "flux-schnell":
-            return SDVersion.flux
+            return Arch.flux
+        if string == "illu":
+            return Arch.illu
+        if string == "illu_v":
+            return Arch.illu_v
         return None
 
     @staticmethod
     def from_checkpoint_name(checkpoint: str):
-        if SDVersion.sdxl.matches(checkpoint):
-            return SDVersion.sdxl
-        return SDVersion.sd15
+        if Arch.sdxl.matches(checkpoint):
+            return Arch.sdxl
+        return Arch.sd15
 
     @staticmethod
-    def match(a: SDVersion, b: SDVersion):
-        if a is SDVersion.all or b is SDVersion.all:
+    def match(a: Arch, b: Arch):
+        if a is Arch.all or b is Arch.all:
             return True
         return a is b
 
     def matches(self, checkpoint: str):
         # Fallback check if it can't be queried from the server
         xl_in_name = "xl" in checkpoint.lower()
-        return self is SDVersion.auto or ((self is SDVersion.sdxl) == xl_in_name)
+        return self is Arch.auto or ((self is Arch.sdxl) == xl_in_name)
 
     def resolve(self, checkpoint: str):
-        if self is SDVersion.auto:
-            return SDVersion.sdxl if SDVersion.sdxl.matches(checkpoint) else SDVersion.sd15
+        if self is Arch.auto:
+            return Arch.sdxl if Arch.sdxl.matches(checkpoint) else Arch.sd15
         return self
 
     @property
     def has_controlnet_inpaint(self):
-        return self is SDVersion.sd15
+        return self is Arch.sd15 or self is Arch.flux
 
     @property
     def supports_lcm(self):
-        return self in [SDVersion.sd15, SDVersion.sdxl]
+        return self in [Arch.sd15, Arch.sdxl]
 
     @property
     def supports_clip_skip(self):
-        return self in [SDVersion.sd15, SDVersion.sdxl]
+        return self in [Arch.sd15, Arch.sdxl, Arch.illu, Arch.illu_v]
 
     @property
     def supports_attention_guidance(self):
-        return self in [SDVersion.sd15, SDVersion.sdxl]
+        return self in [Arch.sd15, Arch.sdxl, Arch.illu, Arch.illu_v]
+
+    @property
+    def is_edit(self):  # edit models make changes to input images
+        return self is Arch.flux_k
+
+    @property
+    def is_sdxl_like(self):
+        # illustrious technically uses sdxl architecture, but has a separate ecosystem
+        return self in [Arch.sdxl, Arch.illu, Arch.illu_v]
+
+    @property
+    def is_flux_like(self):
+        return self in [Arch.flux, Arch.flux_k]
+
+    @property
+    def text_encoders(self):
+        match self:
+            case Arch.sd15:
+                return ["clip_l"]
+            case Arch.sdxl | Arch.illu | Arch.illu_v:
+                return ["clip_l", "clip_g"]
+            case Arch.sd3:
+                return ["clip_l", "clip_g"]
+            case Arch.flux | Arch.flux_k:
+                return ["clip_l", "t5"]
+        raise ValueError(f"Unsupported architecture: {self}")
 
     @staticmethod
     def list():
-        return [SDVersion.sd15, SDVersion.sdxl, SDVersion.sd3, SDVersion.flux]
-
-    @staticmethod
-    def list_strings():
-        return ["sd15", "sdxl", "sd3", "flux", "flux-schnell"]
+        return [Arch.sd15, Arch.sdxl, Arch.sd3, Arch.flux, Arch.flux_k, Arch.illu, Arch.illu_v]
 
 
 class ResourceKind(Enum):
-    checkpoint = "Diffusion Checkpoint"
-    clip = "CLIP model"
-    controlnet = "ControlNet model"
-    clip_vision = "CLIP Vision model"
-    ip_adapter = "IP-Adapter model"
-    lora = "LoRA model"
-    upscaler = "Upscale model"
+    checkpoint = "Diffusion checkpoint"
+    text_encoder = "Text Encoder"
+    vae = "Image Encoder (VAE)"
+    controlnet = "ControlNet"
+    clip_vision = "CLIP Vision"
+    ip_adapter = "IP-Adapter"
+    lora = "LoRA"
+    upscaler = "Upscale"
     inpaint = "Inpaint model"
     embedding = "Textual Embedding"
     preprocessor = "Preprocessor"
@@ -177,7 +232,7 @@ class ControlMode(Enum):
 
     @property
     def has_preprocessor(self):
-        return self.is_control_net and not self in [
+        return self.is_control_net and self not in [
             ControlMode.inpaint,
             ControlMode.blur,
             ControlMode.stencil,
@@ -215,20 +270,79 @@ class ControlMode(Enum):
 
         return control.control_mode_text[self]
 
+    def can_substitute_universal(self, arch: Arch):
+        """True if this control mode is covered by univeral control-net."""
+        if arch.is_sdxl_like:
+            return self in [
+                ControlMode.inpaint,
+                ControlMode.scribble,
+                ControlMode.line_art,
+                ControlMode.soft_edge,
+                ControlMode.canny_edge,
+                ControlMode.depth,
+                ControlMode.normal,
+                ControlMode.pose,
+                ControlMode.segmentation,
+                ControlMode.blur,
+                ControlMode.hands,  # same as depth
+            ]
+        if arch == Arch.flux:
+            return self in [
+                ControlMode.line_art,
+                ControlMode.soft_edge,
+                ControlMode.canny_edge,
+                ControlMode.depth,
+                ControlMode.pose,
+                ControlMode.blur,
+            ]
+        return False
+
+
+def resource_id(kind: ResourceKind, arch: Arch, identifier: ControlMode | UpscalerName | str):
+    if isinstance(identifier, Enum):
+        identifier = identifier.name
+    return f"{kind.name}-{identifier}-{arch.name}"
+
 
 class ResourceId(NamedTuple):
     kind: ResourceKind
-    version: SDVersion
+    arch: Arch
     identifier: ControlMode | UpscalerName | str
 
     @property
     def string(self):
-        return resource_id(self.kind, self.version, self.identifier)
+        return resource_id(self.kind, self.arch, self.identifier)
 
     @property
     def name(self):
         ident = self.identifier.name if isinstance(self.identifier, Enum) else self.identifier
-        return f"{self.kind.value} '{ident}' for {self.version.value}"
+        return f"{self.kind.value} '{ident}' for {self.arch.value}"
+
+    @staticmethod
+    def parse(string: str):
+        kind, identifier, arch = string.split("-")
+        kind = ResourceKind[kind]
+        arch = Arch[arch]
+        if kind in [ResourceKind.controlnet, ResourceKind.ip_adapter, ResourceKind.preprocessor]:
+            if identifier in ControlMode.__members__:
+                identifier = ControlMode[identifier]
+        elif kind == ResourceKind.upscaler:
+            identifier = UpscalerName[identifier]
+        return ResourceId(kind, arch, identifier)
+
+
+class VerificationState(Enum):
+    not_verified = 0
+    in_progress = 1
+    verified = 2
+    mismatch = 3
+    error = 4
+
+
+class VerificationStatus(NamedTuple):
+    state: VerificationState
+    file: ModelFile
+    info: str | None = None
 
 
 class ModelRequirements(Enum):
@@ -236,29 +350,74 @@ class ModelRequirements(Enum):
     insightface = 1
 
 
+class ModelFile(NamedTuple):
+    path: Path
+    url: str
+    id: ResourceId
+    sha256: str | None = None
+
+    @property
+    def name(self):
+        return self.path.name
+
+    @staticmethod
+    def parse(data: dict[str, Any], parent_id: ResourceId):
+        id = ResourceId.parse(data.get("id", parent_id.string))
+        sha256 = data.get("sha256", None)
+        return ModelFile(Path(data["path"]), data["url"], id, sha256)
+
+    def as_dict(self, with_id=True):
+        result = {
+            "id": self.id.string,
+            "path": str(self.path.as_posix()),
+            "url": self.url,
+        }
+        if not with_id:
+            del result["id"]
+        if self.sha256:
+            result["sha256"] = self.sha256
+        return result
+
+    def verify(self, base_dir: Path):
+        if self.sha256 is None:
+            return VerificationStatus(VerificationState.not_verified, self)
+
+        try:
+            file_path = base_dir / self.path
+            assert file_path.exists(), f"File {file_path} does not exist"
+
+            actual_sha256 = compute_sha256(file_path)
+            if actual_sha256 == self.sha256:
+                return VerificationStatus(VerificationState.verified, self)
+            else:
+                return VerificationStatus(VerificationState.mismatch, self, actual_sha256)
+        except Exception as e:
+            return VerificationStatus(VerificationState.error, self, str(e))
+
+
 class ModelResource(NamedTuple):
     name: str
     id: ResourceId
-    files: dict[Path, str]
+    files: list[ModelFile]
     alternatives: list[Path] | None = None  # for backwards compatibility
     requirements: ModelRequirements = ModelRequirements.none
 
     @property
     def filename(self):
         assert len(self.files) == 1
-        return next(iter(self.files)).name
+        return self.files[0].name
 
     @property
     def folder(self):
-        return next(iter(self.files)).parent
+        return self.files[0].path.parent
 
     @property
     def url(self):
         assert len(self.files) == 1
-        return next(iter(self.files.values()))
+        return self.files[0].url
 
     def exists_in(self, path: Path):
-        exact = all((path / filepath).exists() for filepath in self.files.keys())
+        exact = all((path / file.path).exists() for file in self.files)
         alt = self.alternatives is not None and any((path / f).exists() for f in self.alternatives)
         return exact or alt
 
@@ -267,457 +426,57 @@ class ModelResource(NamedTuple):
         return self.id.kind
 
     @property
-    def sd_version(self):
-        return self.id.version
+    def arch(self):
+        return self.id.arch
 
     def __hash__(self):
         return hash(self.id)
 
+    def as_dict(self):
+        result = {
+            "id": self.id.string,
+            "name": self.name,
+            "files": [f.as_dict(len(self.files) > 1) for f in self.files],
+        }
+        if self.alternatives:
+            result["alternatives"] = [str(p.as_posix()) for p in self.alternatives]
+        if self.requirements is not ModelRequirements.none:
+            result["requirements"] = self.requirements.name
+        return result
 
-required_models = [
-    ModelResource(
-        "CLIP Vision model",
-        ResourceId(ResourceKind.clip_vision, SDVersion.all, "ip_adapter"),
-        {
-            Path(
-                "models/clip_vision/clip-vision_vit-h.safetensors"
-            ): "https://huggingface.co/h94/IP-Adapter/resolve/main/models/image_encoder/model.safetensors"
-        },
-        alternatives=[
-            Path("models/clip_vision/SD1.5/model.safetensors"),
-            Path("models/clip_vision/SD1.5/pytorch_model.bin"),
-        ],
-    ),
-    ModelResource(
-        "NMKD Superscale model",
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.default),
-        {
-            Path(
-                "models/upscale_models/4x_NMKD-Superscale-SP_178000_G.pth"
-            ): "https://huggingface.co/gemasai/4x_NMKD-Superscale-SP_178000_G/resolve/main/4x_NMKD-Superscale-SP_178000_G.pth"
-        },
-    ),
-    ModelResource(
-        "OmniSR Superscale model",
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_4x),
-        {
-            Path(
-                "models/upscale_models/OmniSR_X2_DIV2K.safetensors"
-            ): "https://huggingface.co/Acly/Omni-SR/resolve/main/OmniSR_X2_DIV2K.safetensors",
-            Path(
-                "models/upscale_models/OmniSR_X3_DIV2K.safetensors"
-            ): "https://huggingface.co/Acly/Omni-SR/resolve/main/OmniSR_X3_DIV2K.safetensors",
-            Path(
-                "models/upscale_models/OmniSR_X4_DIV2K.safetensors"
-            ): "https://huggingface.co/Acly/Omni-SR/resolve/main/OmniSR_X4_DIV2K.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Inpaint",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.inpaint),
-        {
-            Path(
-                "models/controlnet/control_v11p_sd15_inpaint_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_v11p_sd15_inpaint_fp16.safetensors"
-        },
-    ),
-    ModelResource(
-        "ControlNet Unblur",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.blur),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11f1e_sd15_tile_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11f1e_sd15_tile_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "IP-Adapter (SD1.5)",
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.reference),
-        {
-            Path(
-                "models/ipadapter/ip-adapter_sd15.safetensors"
-            ): "https://huggingface.co/h94/IP-Adapter/resolve/main/models/ip-adapter_sd15.safetensors"
-        },
-    ),
-    ModelResource(
-        "IP-Adapter (SDXL)",
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sdxl, ControlMode.reference),
-        {
-            Path(
-                "models/ipadapter/ip-adapter_sdxl_vit-h.safetensors"
-            ): "https://huggingface.co/h94/IP-Adapter/resolve/main/sdxl_models/ip-adapter_sdxl_vit-h.safetensors",
-        },
-    ),
-    ModelResource(
-        "Hyper-SD LoRA (SD1.5)",
-        ResourceId(ResourceKind.lora, SDVersion.sd15, "hyper"),
-        {
-            Path(
-                "models/loras/Hyper-SD15-8steps-CFG-lora.safetensors"
-            ): "https://huggingface.co/ByteDance/Hyper-SD/resolve/main/Hyper-SD15-8steps-CFG-lora.safetensors",
-        },
-    ),
-    ModelResource(
-        "Hyper-SD LoRA (SDXL)",
-        ResourceId(ResourceKind.lora, SDVersion.sdxl, "hyper"),
-        {
-            Path(
-                "models/loras/Hyper-SDXL-8steps-CFG-lora.safetensors"
-            ): "https://huggingface.co/ByteDance/Hyper-SD/resolve/main/Hyper-SDXL-8steps-CFG-lora.safetensors",
-        },
-    ),
-    ModelResource(
-        "Fooocus Inpaint",
-        ResourceId(ResourceKind.inpaint, SDVersion.sdxl, "fooocus-inpaint"),
-        {
-            Path(
-                "models/inpaint/fooocus_inpaint_head.pth"
-            ): "https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/fooocus_inpaint_head.pth",
-            Path(
-                "models/inpaint/inpaint_v26.fooocus.patch"
-            ): "https://huggingface.co/lllyasviel/fooocus_inpaint/resolve/main/inpaint_v26.fooocus.patch",
-        },
-    ),
-    ModelResource(
-        "MAT Inpaint",
-        ResourceId(ResourceKind.inpaint, SDVersion.all, "default"),
-        {
-            Path(
-                "models/inpaint/MAT_Places512_G_fp16.safetensors"
-            ): "https://huggingface.co/Acly/MAT/resolve/main/MAT_Places512_G_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "Easy Negative",
-        ResourceId(ResourceKind.embedding, SDVersion.sd15, "easy-negative"),
-        {
-            Path(
-                "models/embeddings/EasyNegative.safetensors"
-            ): "https://huggingface.co/embed/EasyNegative/resolve/main/EasyNegative.safetensors"
-        },
-    ),
-]
+    @staticmethod
+    def from_dict(data: dict[str, Any]):
+        id = ResourceId.parse(data["id"])
+        files = [ModelFile.parse(f, id) for f in data["files"]]
+        alternatives = [Path(p) for p in data.get("alternatives", [])]
+        requirements = (
+            ModelRequirements[data["requirements"]]
+            if "requirements" in data
+            else ModelRequirements.none
+        )
+        return ModelResource(data["name"], id, files, alternatives, requirements)
 
-default_checkpoints = [
-    ModelResource(
-        "Realistic Vision (Photography)",
-        ResourceId(ResourceKind.checkpoint, SDVersion.sd15, "realistic-vision"),
-        {
-            Path(
-                "models/checkpoints/realisticVisionV51_v51VAE.safetensors"
-            ): "https://huggingface.co/lllyasviel/fav_models/resolve/main/fav/realisticVisionV51_v51VAE.safetensors",
-        },
-    ),
-    ModelResource(
-        "DreamShaper (Artwork)",
-        ResourceId(ResourceKind.checkpoint, SDVersion.sd15, "dreamshaper"),
-        {
-            Path(
-                "models/checkpoints/dreamshaper_8.safetensors"
-            ): "https://huggingface.co/Lykon/DreamShaper/resolve/main/DreamShaper_8_pruned.safetensors",
-        },
-    ),
-    ModelResource(
-        "Flat2D AniMerge (Cartoon/Anime)",
-        ResourceId(ResourceKind.checkpoint, SDVersion.sd15, "flat2d-animerge"),
-        {
-            Path(
-                "models/checkpoints/flat2DAnimerge_v45Sharp.safetensors"
-            ): "https://huggingface.co/Acly/SD-Checkpoints/resolve/main/flat2DAnimerge_v45Sharp.safetensors"
-        },
-    ),
-    ModelResource(
-        "Juggernaut XL",
-        ResourceId(ResourceKind.checkpoint, SDVersion.sdxl, "juggernaut"),
-        {
-            Path(
-                "models/checkpoints/juggernautXL_version6Rundiffusion.safetensors"
-            ): "https://huggingface.co/lllyasviel/fav_models/resolve/main/fav/juggernautXL_version6Rundiffusion.safetensors"
-        },
-    ),
-    ModelResource(
-        "ZavyChroma XL",
-        ResourceId(ResourceKind.checkpoint, SDVersion.sdxl, "zavychroma"),
-        {
-            Path(
-                "models/checkpoints/zavychromaxl_v80.safetensors"
-            ): "https://huggingface.co/misri/zavychromaxl_v80/resolve/main/zavychromaxl_v80.safetensors"
-        },
-    ),
-    ModelResource(
-        "Flux [schnell]",
-        ResourceId(ResourceKind.checkpoint, SDVersion.flux, "flux-schnell"),
-        {
-            Path(
-                "models/checkpoints/flux1-schnell-fp8.safetensors"
-            ): "https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors"
-        },
-    ),
-]
+    @staticmethod
+    def from_list(data: list[dict[str, Any]]):
+        return [ModelResource.from_dict(d) for d in data]
 
-upscale_models = [
-    ModelResource(
-        "HAT Super-Resolution (quality)",
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.quality),
-        {
-            Path(
-                "models/upscale_models/HAT_SRx4_ImageNet-pretrain.pth"
-            ): "https://huggingface.co/Acly/hat/resolve/main/HAT_SRx4_ImageNet-pretrain.pth"
-        },
-    ),
-    ModelResource(
-        "Real HAT GAN Super-Resolution (sharper)",
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.sharp),
-        {
-            Path(
-                "models/upscale_models/Real_HAT_GAN_sharper.pth"
-            ): "https://huggingface.co/Acly/hat/resolve/main/Real_HAT_GAN_sharper.pth"
-        },
-    ),
-]
-
-optional_models = [
-    ModelResource(
-        "ControlNet Scribble",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.scribble),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11p_sd15_scribble_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11p_sd15_scribble_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Line Art",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.line_art),
-        {
-            Path(
-                "models/controlnet/control_v11p_sd15_lineart_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_v11p_sd15_lineart_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Soft Edge",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.soft_edge),
-        {
-            Path(
-                "models/controlnet/control_v11p_sd15_softedge_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_v11p_sd15_softedge_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Canny Edge",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.canny_edge),
-        {
-            Path(
-                "models/controlnet/control_v11p_sd15_canny_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_v11p_sd15_canny_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Depth",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.depth),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11f1p_sd15_depth_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11f1p_sd15_depth_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Normal",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.normal),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11p_sd15_normalbae_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11p_sd15_normalbae_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Pose",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.pose),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11p_sd15_openpose_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11p_sd15_openpose_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Segmentation",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.segmentation),
-        {
-            Path(
-                "models/controlnet/control_lora_rank128_v11p_sd15_seg_fp16.safetensors"
-            ): "https://huggingface.co/comfyanonymous/ControlNet-v1-1_fp16_safetensors/resolve/main/control_lora_rank128_v11p_sd15_seg_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Stencil",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.stencil),
-        {
-            Path(
-                "models/controlnet/control_v1p_sd15_qrcode_monster.safetensors"
-            ): "https://huggingface.co/monster-labs/control_v1p_sd15_qrcode_monster/resolve/main/control_v1p_sd15_qrcode_monster.safetensors",
-        },
-    ),
-    ModelResource(
-        "ControlNet Hand Refiner",
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.hands),
-        {
-            Path(
-                "models/controlnet/control_sd15_inpaint_depth_hand_fp16.safetensors"
-            ): "https://huggingface.co/hr16/ControlNet-HandRefiner-pruned/resolve/main/control_sd15_inpaint_depth_hand_fp16.safetensors",
-        },
-    ),
-    ModelResource(
-        "IP-Adapter Face (SD1.5)",
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.face),
-        {
-            Path(
-                "models/ipadapter/ip-adapter-faceid-plusv2_sd15.bin"
-            ): "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sd15.bin",
-            Path(
-                "models/loras/ip-adapter-faceid-plusv2_sd15_lora.safetensors"
-            ): "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sd15_lora.safetensors",
-        },
-        requirements=ModelRequirements.insightface,
-    ),
-    ModelResource(
-        "ControlNet Universal (XL)",
-        ResourceId(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.universal),
-        {
-            Path(
-                "models/controlnet/xinsir-controlnet-union-sdxl-1.0-promax.safetensors"
-            ): "https://huggingface.co/xinsir/controlnet-union-sdxl-1.0/resolve/main/diffusion_pytorch_model_promax.safetensors",
-        },
-    ),
-    ModelResource(
-        "IP-Adapter Face (XL)",
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sdxl, ControlMode.face),
-        {
-            Path(
-                "models/ipadapter/ip-adapter-faceid-plusv2_sdxl.bin"
-            ): "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sdxl.bin",
-            Path(
-                "models/loras/ip-adapter-faceid-plusv2_sdxl_lora.safetensors"
-            ): "https://huggingface.co/h94/IP-Adapter-FaceID/resolve/main/ip-adapter-faceid-plusv2_sdxl_lora.safetensors",
-        },
-        requirements=ModelRequirements.insightface,
-    ),
-]
-
-prefetch_models = [
-    ModelResource(
-        "Scribble Preprocessor",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, ControlMode.scribble),
-        {
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/table5_pidinet.pth"
-            ): "https://huggingface.co/lllyasviel/Annotators/resolve/main/table5_pidinet.pth"
-        },
-    ),
-    ModelResource(
-        "Line Art Preprocessor",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, ControlMode.line_art),
-        {
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/sk_model.pth"
-            ): "https://huggingface.co/lllyasviel/Annotators/resolve/main/sk_model.pth",
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/lllyasviel/Annotators/sk_model2.pth"
-            ): "https://huggingface.co/lllyasviel/Annotators/resolve/main/sk_model2.pth",
-        },
-    ),
-    ModelResource(
-        "Soft Edge Preprocessor",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, ControlMode.soft_edge),
-        {
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/TheMistoAI/MistoLine/Anyline/MTEED.pth"
-            ): "https://huggingface.co/TheMistoAI/MistoLine/resolve/main/Anyline/MTEED.pth"
-        },
-    ),
-    ModelResource(
-        "Depth Preprocessor",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, ControlMode.depth),
-        {
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/depth-anything/Depth-Anything-V2-Base/depth_anything_v2_vitb.pth"
-            ): "https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth"
-        },
-    ),
-    ModelResource(
-        "Pose Preprocessor",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, ControlMode.pose),
-        {
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/hr16/yolo-nas-fp16/yolo_nas_l_fp16.onnx"
-            ): "https://huggingface.co/hr16/yolo-nas-fp16/resolve/main/yolo_nas_l_fp16.onnx",
-            Path(
-                "custom_nodes/comfyui_controlnet_aux/ckpts/yzd-v/DWPose/dw-ll_ucoco_384.onnx"
-            ): "https://huggingface.co/yzd-v/DWPose/resolve/main/dw-ll_ucoco_384.onnx",
-        },
-    ),
-    ModelResource(
-        "NSFW Filter",
-        ResourceId(ResourceKind.preprocessor, SDVersion.all, "safetychecker"),
-        {
-            Path(
-                "custom_nodes/comfyui-tooling-nodes/safetychecker/model.safetensors"
-            ): "https://huggingface.co/CompVis/stable-diffusion-safety-checker/resolve/refs%2Fpr%2F41/model.safetensors"
-        },
-    ),
-]
-
-deprecated_models = [
-    ModelResource(
-        "LCM-LoRA (SD1.5)",
-        ResourceId(ResourceKind.lora, SDVersion.sd15, "lcm"),
-        {
-            Path(
-                "models/loras/lcm-lora-sdv1-5.safetensors"
-            ): "https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors",
-        },
-    ),
-    ModelResource(
-        "LCM-LoRA (SDXL)",
-        ResourceId(ResourceKind.lora, SDVersion.sdxl, "lcm"),
-        {
-            Path(
-                "models/loras/lcm-lora-sdxl.safetensors"
-            ): "https://huggingface.co/latent-consistency/lcm-lora-sdxl/resolve/main/pytorch_lora_weights.safetensors",
-        },
-    ),
-]
+    def verify(self, base_dir: Path):
+        for file in self.files:
+            file_path = base_dir / file.path
+            if file_path.exists():
+                yield VerificationStatus(VerificationState.in_progress, file)
+                yield file.verify(base_dir)
 
 
-class MissingResource(Exception):
-    kind: ResourceKind
-    names: Sequence[str] | Sequence[ResourceId] | Sequence[CustomNode] | None
+_models_file = Path(__file__).parent / "presets" / "models.json"
+_models_dict = json.loads(_models_file.read_text())
 
-    def __init__(
-        self,
-        kind: ResourceKind,
-        names: Sequence[str] | Sequence[ResourceId] | Sequence[CustomNode] | None = None,
-    ):
-        self.kind = kind
-        self.names = names
-
-    def __str__(self):
-        names = self.names or []
-        names = [getattr(n, "name", n) for n in names]
-        return f"Missing {self.kind.value}: {', '.join(str(n) for n in names)}"
-
-    @property
-    def search_path_string(self):
-        if names := self.names:
-            paths = (
-                search_path(n.kind, n.version, n.identifier)
-                for n in names
-                if isinstance(n, ResourceId)
-            )
-            items = (", ".join(sp) for sp in paths if sp)
-            return "Checking for files with a (partial) match:\n" + "\n".join(items)
-        return ""
-
+required_models = ModelResource.from_list(_models_dict["required"])
+default_checkpoints = ModelResource.from_list(_models_dict["checkpoints"])
+upscale_models = ModelResource.from_list(_models_dict["upscale"])
+optional_models = ModelResource.from_list(_models_dict["optional"])
+prefetch_models = ModelResource.from_list(_models_dict["prefetch"])
+deprecated_models = ModelResource.from_list(_models_dict["deprecated"])
 
 all_resources = (
     [n.name for n in required_custom_nodes]
@@ -741,96 +500,158 @@ def all_models(include_deprecated=False):
     return result
 
 
-def resource_id(
-    kind: ResourceKind, version: SDVersion, identifier: ControlMode | UpscalerName | str
-):
-    if isinstance(identifier, Enum):
-        identifier = identifier.name
-    return f"{kind.name}-{identifier}-{version.name}"
-
-
 def find_resource(id: ResourceId, include_deprecated=False):
-    return next((m for m in all_models(include_deprecated) if m.id == id), None)
+    return next(
+        (m for m in all_models(include_deprecated) if any(f.id == id for f in m.files)), None
+    )
 
 
-def search_path(
-    kind: ResourceKind, version: SDVersion, identifier: ControlMode | UpscalerName | str
-):
-    return search_paths.get(resource_id(kind, version, identifier), None)
+def compute_sha256(file_path: Path) -> str:
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
 
-def is_required(
-    kind: ResourceKind, version: SDVersion, identifier: ControlMode | UpscalerName | str
-):
-    return ResourceId(kind, version, identifier) in required_resource_ids
+def update_model_checksums(models_path: Path):
+    modified = False
+
+    categories = ["required", "checkpoints", "upscale", "optional", "prefetch", "deprecated"]
+    for category in categories:
+        for model_idx, model in enumerate(_models_dict[category]):
+            for file_idx, file in enumerate(model["files"]):
+                file_path = models_path / file["path"]
+                if not file_path.exists():
+                    print(f"Not found: {file_path}")
+                    continue
+                if "sha256" not in file:
+                    try:
+                        checksum = compute_sha256(file_path)
+                        _models_dict[category][model_idx]["files"][file_idx]["sha256"] = checksum
+                        print(f"Added checksum for {file['path']}: {checksum}")
+                        modified = True
+                    except Exception as e:
+                        print(f"Error computing checksum for {file['path']}: {e}")
+
+    if modified:
+        with open(_models_file, "w") as f:
+            json.dump(_models_dict, f, indent=2)
+        print(f"Updated checksums written to {_models_file}")
+
+
+def verify_model_integrity(base_dir: Path | None = None):
+    if base_dir is None:
+        base_dir = Path(__file__).parent.parent.parent
+
+    for model in all_models():
+        yield from model.verify(base_dir)
+
+
+def search_path(kind: ResourceKind, arch: Arch, identifier: ControlMode | UpscalerName | str):
+    return search_paths.get(resource_id(kind, arch, identifier), None)
+
+
+def is_required(kind: ResourceKind, arch: Arch, identifier: ControlMode | UpscalerName | str):
+    return ResourceId(kind, arch, identifier) in required_resource_ids
 
 
 # fmt: off
 search_paths: dict[str, list[str]] = {
-    resource_id(ResourceKind.clip, SDVersion.sd3, "clip_l") : ["clip_l"],
-    resource_id(ResourceKind.clip, SDVersion.sd3, "clip_g") : ["clip_g"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.inpaint):  ["control_v11p_sd15_inpaint"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.universal):  ["union-sdxl", "xinsirunion"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.scribble): ["control_v11p_sd15_scribble", "control_lora_rank128_v11p_sd15_scribble"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.scribble): ["xinsirscribble", "scribble-sdxl", "mistoline", "control-lora-sketch-rank", "sai_xl_sketch_"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.line_art): ["control_v11p_sd15_lineart", "control_lora_rank128_v11p_sd15_lineart"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.line_art): ["xinsirscribble", "mistoline", "scribble-sdxl", "control-lora-sketch-rank", "sai_xl_sketch_"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.soft_edge): ["control_v11p_sd15_softedge", "control_lora_rank128_v11p_sd15_softedge"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.soft_edge): ["mistoline", "xinsirscribble", "scribble-sdxl"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.canny_edge): ["control_v11p_sd15_canny", "control_lora_rank128_v11p_sd15_canny"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.canny_edge): ["xinsircanny", "canny-sdxl" "control-lora-canny-rank", "sai_xl_canny_", "mistoline"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.depth): ["control_sd15_depth_anything", "control_v11f1p_sd15_depth", "control_lora_rank128_v11f1p_sd15_depth"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.depth): ["xinsirdepth", "depth-sdxl", "control-lora-depth-rank", "sai_xl_depth_"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.normal): ["control_v11p_sd15_normalbae", "control_lora_rank128_v11p_sd15_normalbae"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.pose): ["control_v11p_sd15_openpose", "control_lora_rank128_v11p_sd15_openpose"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.pose): ["xinsiropenpose", "openpose-sdxl", "control-lora-openposexl2-rank", "thibaud_xl_openpose"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.segmentation): ["control_v11p_sd15_seg", "control_lora_rank128_v11p_sd15_seg"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.segmentation): ["sdxl_segmentation_ade20k_controlnet"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.blur): ["control_v11f1e_sd15_tile", "control_lora_rank128_v11f1e_sd15_tile"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.blur): ["xinsirtile", "tile-sdxl", "ttplanetsdxlcontrolnet", "ttplanet_sdxl_controlnet_tile_realistic", "ttplanet_controlnet_tile_realistic"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.stencil): ["control_v1p_sd15_qrcode_monster"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.stencil): ["sdxl_qrcode_monster"],
-    resource_id(ResourceKind.controlnet, SDVersion.sd15, ControlMode.hands): ["control_sd15_inpaint_depth_hand"],
-    resource_id(ResourceKind.controlnet, SDVersion.sdxl, ControlMode.hands): ["control-lora-depth-rank", "sai_xl_depth_"],
-    resource_id(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.reference): ["ip-adapter_sd15"],
-    resource_id(ResourceKind.ip_adapter, SDVersion.sdxl, ControlMode.reference): ["ip-adapter_sdxl_vit-h"],
-    resource_id(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.face): ["ip-adapter-faceid-plusv2_sd15", "ip-adapter-faceid-plus_sd15"],
-    resource_id(ResourceKind.ip_adapter, SDVersion.sdxl, ControlMode.face): ["ip-adapter-faceid-plusv2_sdxl", "ip-adapter-faceid_sdxl"],
-    resource_id(ResourceKind.clip_vision, SDVersion.all, "ip_adapter"): ["sd1.5/pytorch_model.bin", "sd1.5/model.safetensors", "clip-vision_vit-h.safetensors", "clip-vit-h-14-laion2b-s32b-b79k"],
-    resource_id(ResourceKind.lora, SDVersion.sd15, "lcm"): ["lcm-lora-sdv1-5.safetensors", "lcm/sd1.5/pytorch_lora_weights.safetensors"],
-    resource_id(ResourceKind.lora, SDVersion.sdxl, "lcm"): ["lcm-lora-sdxl.safetensors", "lcm/sdxl/pytorch_lora_weights.safetensors"],
-    resource_id(ResourceKind.lora, SDVersion.sdxl, "lightning"): ["sdxl_lightning_8step_lora"],
-    resource_id(ResourceKind.lora, SDVersion.sd15, "hyper"): ["Hyper-SD15-8steps-CFG-lora"],
-    resource_id(ResourceKind.lora, SDVersion.sdxl, "hyper"): ["Hyper-SDXL-8steps-CFG-lora"],
-    resource_id(ResourceKind.lora, SDVersion.sd15, ControlMode.face): ["ip-adapter-faceid-plusv2_sd15_lora", "ip-adapter-faceid-plus_sd15_lora"],
-    resource_id(ResourceKind.lora, SDVersion.sdxl, ControlMode.face): ["ip-adapter-faceid-plusv2_sdxl_lora", "ip-adapter-faceid_sdxl_lora"],
-    resource_id(ResourceKind.upscaler, SDVersion.all, UpscalerName.default): [UpscalerName.default.value],
-    resource_id(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_2x): [UpscalerName.fast_2x.value],
-    resource_id(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_3x): [UpscalerName.fast_3x.value],
-    resource_id(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_4x): [UpscalerName.fast_4x.value],
-    resource_id(ResourceKind.inpaint, SDVersion.sdxl, "fooocus_head"): ["fooocus_inpaint_head.pth"],
-    resource_id(ResourceKind.inpaint, SDVersion.sdxl, "fooocus_patch"): ["inpaint_v26.fooocus.patch"],
-    resource_id(ResourceKind.inpaint, SDVersion.all, "default"): ["MAT_Places512_G_fp16", "Places_512_FullData_G", "big-lama.pt"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.inpaint): ["control_v11p_sd15_inpaint"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.inpaint): ["flux.1-dev-controlnet-inpaint"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.inpaint): ["noobaiinpainting"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.universal): ["union-sdxl", "xinsirunion"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.universal): ["union-sdxl", "xinsirunion"],
+    resource_id(ResourceKind.controlnet, Arch.illu_v, ControlMode.universal): ["union-sdxl", "xinsirunion"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.universal): ["flux.1-dev-controlnet-union-pro-2.0", "flux.1-dev-controlnet-union-pro", "flux.1-dev-controlnet-union", "flux1devcontrolnetunion"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.scribble): ["control_v11p_sd15_scribble", "control_lora_rank128_v11p_sd15_scribble"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.scribble): ["xinsirscribble", "scribble-sdxl", "mistoline_fp16", "mistoline_rank", "control-lora-sketch-rank", "sai_xl_sketch_"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.scribble): ["noob-sdxl-controlnet-scribble_pidinet", "noobaixlcontrolnet_epsscribble", "noob-sdxl-controlnet-scribble"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.line_art): ["control_v11p_sd15_lineart", "control_lora_rank128_v11p_sd15_lineart"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.line_art): ["xinsirscribble", "mistoline_fp16", "mistoline_rank", "scribble-sdxl", "control-lora-sketch-rank", "sai_xl_sketch_"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.line_art): ["mistoline_flux"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.line_art): ["noob-sdxl-controlnet-lineart_anime", "noobaixlcontrolnet_epslineart", "noob-sdxl-controlnet-lineart"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.soft_edge): ["control_v11p_sd15_softedge", "control_lora_rank128_v11p_sd15_softedge"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.soft_edge): ["mistoline_fp16", "mistoline_rank", "xinsirscribble", "scribble-sdxl"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.soft_edge): ["mistoline_flux"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.soft_edge): ["noob-sdxl-controlnet-softedge", "noobaixlcontrolnet_epssoftedge"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.canny_edge): ["control_v11p_sd15_canny", "control_lora_rank128_v11p_sd15_canny"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.canny_edge): ["xinsircanny", "canny-sdxl" "control-lora-canny-rank", "sai_xl_canny_"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.canny_edge): ["flux-canny", "mistoline_flux"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.canny_edge): ["noob_sdxl_controlnet_canny", "noobaixlcontrolnet_epscanny"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.depth): ["control_sd15_depth_anything", "control_v11f1p_sd15_depth", "control_lora_rank128_v11f1p_sd15_depth"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.depth): ["xinsirdepth", "depth-sdxl", "control-lora-depth-rank", "sai_xl_depth_"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.depth): ["flux-depth"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.depth): ["noob-sdxl-controlnet-depth", "noobaixlcontrolnet_epsdepth"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.normal): ["control_v11p_sd15_normalbae", "control_lora_rank128_v11p_sd15_normalbae"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.normal): ["noob-sdxl-controlnet-normal", "noobaixlcontrolnet_epsnormal"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.pose): ["control_v11p_sd15_openpose", "control_lora_rank128_v11p_sd15_openpose"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.pose): ["xinsiropenpose", "openpose-sdxl", "control-lora-openposexl2-rank", "thibaud_xl_openpose"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.pose): ["noob-sdxl-controlnet-openpose", "noobaixlcontrolnet_openpose"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.segmentation): ["control_v11p_sd15_seg", "control_lora_rank128_v11p_sd15_seg"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.segmentation): ["sdxl_segmentation_ade20k_controlnet"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.blur): ["control_v11f1e_sd15_tile", "control_lora_rank128_v11f1e_sd15_tile"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.blur): ["xinsirtile", "tile-sdxl", "ttplanetsdxlcontrolnet", "ttplanet_sdxl_controlnet_tile_realistic", "ttplanet_controlnet_tile_realistic"],
+    resource_id(ResourceKind.controlnet, Arch.flux, ControlMode.blur): ["flux.1-dev-controlnet-upscale"],
+    resource_id(ResourceKind.controlnet, Arch.illu, ControlMode.blur): ["noob-sdxl-controlnet-tile", "noobaixlcontrolnet_epstile"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.stencil): ["control_v1p_sd15_qrcode_monster"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.stencil): ["sdxl_qrcode_monster"],
+    resource_id(ResourceKind.controlnet, Arch.sd15, ControlMode.hands): ["control_sd15_inpaint_depth_hand"],
+    resource_id(ResourceKind.controlnet, Arch.sdxl, ControlMode.hands): ["control-lora-depth-rank", "sai_xl_depth_"],
+    resource_id(ResourceKind.ip_adapter, Arch.sd15, ControlMode.reference): ["ip-adapter_sd15"],
+    resource_id(ResourceKind.ip_adapter, Arch.sdxl, ControlMode.reference): ["ip-adapter_sdxl_vit-h"],
+    resource_id(ResourceKind.ip_adapter, Arch.flux, ControlMode.reference): ["flux1-redux-dev"],
+    resource_id(ResourceKind.ip_adapter, Arch.illu, ControlMode.reference): ["noobipa"],
+    resource_id(ResourceKind.ip_adapter, Arch.sd15, ControlMode.face): ["ip-adapter-faceid-plusv2_sd15", "ip-adapter-faceid-plus_sd15"],
+    resource_id(ResourceKind.ip_adapter, Arch.sdxl, ControlMode.face): ["ip-adapter-faceid-plusv2_sdxl", "ip-adapter-faceid_sdxl"],
+    resource_id(ResourceKind.clip_vision, Arch.all, "ip_adapter"): ["sd1.5/pytorch_model.bin", "sd1.5/model.safetensors", "clip-vision_vit-h.safetensors", "clip-vit-h-14-laion2b-s32b-b79k"],
+    resource_id(ResourceKind.clip_vision, Arch.flux, "redux"): ["sigclip_vision_patch14_384"],
+    resource_id(ResourceKind.clip_vision, Arch.illu, "ip_adapter"): ["clip-vit-bigg", "clip_vision_g", "clip-vision_vit-g"],
+    resource_id(ResourceKind.lora, Arch.sd15, "lcm"): ["lcm-lora-sdv1-5.safetensors", "lcm/sd1.5/pytorch_lora_weights.safetensors"],
+    resource_id(ResourceKind.lora, Arch.sdxl, "lcm"): ["lcm-lora-sdxl.safetensors", "lcm/sdxl/pytorch_lora_weights.safetensors"],
+    resource_id(ResourceKind.lora, Arch.sdxl, "lightning"): ["sdxl_lightning_8step_lora"],
+    resource_id(ResourceKind.lora, Arch.sd15, "hyper"): ["Hyper-SD15-8steps-CFG-lora"],
+    resource_id(ResourceKind.lora, Arch.sdxl, "hyper"): ["Hyper-SDXL-8steps-CFG-lora"],
+    resource_id(ResourceKind.lora, Arch.sd15, ControlMode.face): ["ip-adapter-faceid-plusv2_sd15_lora", "ip-adapter-faceid-plus_sd15_lora"],
+    resource_id(ResourceKind.lora, Arch.sdxl, ControlMode.face): ["ip-adapter-faceid-plusv2_sdxl_lora", "ip-adapter-faceid_sdxl_lora"],
+    resource_id(ResourceKind.lora, Arch.flux, ControlMode.depth): ["flux1-depth"],
+    resource_id(ResourceKind.lora, Arch.flux, ControlMode.canny_edge): ["flux1-canny"],
+    resource_id(ResourceKind.upscaler, Arch.all, UpscalerName.default): [UpscalerName.default.value],
+    resource_id(ResourceKind.upscaler, Arch.all, UpscalerName.fast_2x): [UpscalerName.fast_2x.value],
+    resource_id(ResourceKind.upscaler, Arch.all, UpscalerName.fast_3x): [UpscalerName.fast_3x.value],
+    resource_id(ResourceKind.upscaler, Arch.all, UpscalerName.fast_4x): [UpscalerName.fast_4x.value],
+    resource_id(ResourceKind.inpaint, Arch.sdxl, "fooocus_head"): ["fooocus_inpaint_head.pth"],
+    resource_id(ResourceKind.inpaint, Arch.sdxl, "fooocus_patch"): ["inpaint_v26.fooocus"],
+    resource_id(ResourceKind.inpaint, Arch.all, "default"): ["MAT_Places512_G_fp16", "Places_512_FullData_G", "big-lama.pt"],
+    resource_id(ResourceKind.text_encoder, Arch.all, "clip_l"): ["clip_l"],
+    resource_id(ResourceKind.text_encoder, Arch.all, "clip_g"): ["clip_g"],
+    resource_id(ResourceKind.text_encoder, Arch.all, "t5"): ["t5"],
+    resource_id(ResourceKind.vae, Arch.sd15, "default"): ["vae-ft-mse-840000-ema"],
+    resource_id(ResourceKind.vae, Arch.sdxl, "default"): ["sdxl_vae"],
+    resource_id(ResourceKind.vae, Arch.illu, "default"): ["sdxl_vae"],
+    resource_id(ResourceKind.vae, Arch.illu_v, "default"): ["sdxl_vae"],
+    resource_id(ResourceKind.vae, Arch.sd3, "default"): ["sd3"],
+    resource_id(ResourceKind.vae, Arch.flux, "default"): ["flux", "ae.s"],
+    resource_id(ResourceKind.vae, Arch.flux_k, "default"): ["flux", "ae.s"],
 }
 # fmt: on
 
-required_resource_ids = set(
-    [
-        ResourceId(ResourceKind.clip, SDVersion.sd3, "clip_l"),
-        ResourceId(ResourceKind.clip, SDVersion.sd3, "clip_g"),
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.inpaint),
-        ResourceId(ResourceKind.controlnet, SDVersion.sd15, ControlMode.blur),
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sd15, ControlMode.reference),
-        ResourceId(ResourceKind.ip_adapter, SDVersion.sdxl, ControlMode.reference),
-        ResourceId(ResourceKind.clip_vision, SDVersion.all, "ip_adapter"),
-        ResourceId(ResourceKind.lora, SDVersion.sd15, "hyper"),
-        ResourceId(ResourceKind.lora, SDVersion.sdxl, "hyper"),
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.default),
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_2x),
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_3x),
-        ResourceId(ResourceKind.upscaler, SDVersion.all, UpscalerName.fast_4x),
-        ResourceId(ResourceKind.inpaint, SDVersion.sdxl, "fooocus_head"),
-        ResourceId(ResourceKind.inpaint, SDVersion.sdxl, "fooocus_patch"),
-        ResourceId(ResourceKind.inpaint, SDVersion.all, "default"),
-    ]
-)
+required_resource_ids = set([
+    ResourceId(ResourceKind.text_encoder, Arch.sd3, "clip_l"),
+    ResourceId(ResourceKind.text_encoder, Arch.sd3, "clip_g"),
+    ResourceId(ResourceKind.controlnet, Arch.sd15, ControlMode.inpaint),
+    ResourceId(ResourceKind.controlnet, Arch.sd15, ControlMode.blur),
+    ResourceId(ResourceKind.ip_adapter, Arch.sd15, ControlMode.reference),
+    ResourceId(ResourceKind.ip_adapter, Arch.sdxl, ControlMode.reference),
+    ResourceId(ResourceKind.clip_vision, Arch.all, "ip_adapter"),
+    ResourceId(ResourceKind.lora, Arch.sd15, "hyper"),
+    ResourceId(ResourceKind.lora, Arch.sdxl, "hyper"),
+    ResourceId(ResourceKind.upscaler, Arch.all, UpscalerName.default),
+    ResourceId(ResourceKind.upscaler, Arch.all, UpscalerName.fast_2x),
+    ResourceId(ResourceKind.upscaler, Arch.all, UpscalerName.fast_3x),
+    ResourceId(ResourceKind.upscaler, Arch.all, UpscalerName.fast_4x),
+    ResourceId(ResourceKind.inpaint, Arch.sdxl, "fooocus_head"),
+    ResourceId(ResourceKind.inpaint, Arch.sdxl, "fooocus_patch"),
+    ResourceId(ResourceKind.inpaint, Arch.all, "default"),
+])

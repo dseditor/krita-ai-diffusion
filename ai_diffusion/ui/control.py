@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt5.QtGui import QResizeEvent
 from PyQt5.QtWidgets import QWidget, QLabel, QSlider, QToolButton, QCheckBox
 from PyQt5.QtWidgets import QComboBox, QHBoxLayout, QVBoxLayout, QGridLayout, QFrame
-from PyQt5.QtCore import Qt, QMetaObject, QSize, pyqtSignal
+from PyQt5.QtCore import Qt, QMetaObject, pyqtSignal
 
 from ..resources import ControlMode
 from ..properties import Binding, bind, bind_combo, bind_toggle
@@ -16,16 +16,13 @@ from . import theme
 
 
 class ControlWidget(QWidget):
-    _control_list: ControlLayerList
-    _control: ControlLayer
-    _connections: list[QMetaObject.Connection | Binding]
-
     def __init__(
-        self, control_list: ControlLayerList, control: ControlLayer, parent: ControlListWidget
+        self, control_list: ControlLayerList | None, control: ControlLayer, parent: QWidget
     ):
         super().__init__(parent)
         self._control_list = control_list
         self._control = control
+        self._connections: list[QMetaObject.Connection | Binding] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -57,7 +54,7 @@ class ControlWidget(QWidget):
         self.preset_slider.setToolTip(_("Control strength: how much the layer affects the image"))
 
         self.error_text = QLabel(self)
-        self.error_text.setStyleSheet(f"color: {theme.red};")
+        self.error_text.setStyleSheet(f"QLabel {{ color: {theme.yellow}; }}")
         self.error_text.setVisible(not control.is_supported)
         self._set_error(control.error_text)
 
@@ -80,13 +77,6 @@ class ControlWidget(QWidget):
         self.expand_button.setChecked(False)
         self.expand_button.clicked.connect(self._toggle_extended)
 
-        self.remove_button = QToolButton(self)
-        self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        self.remove_button.setIcon(theme.icon("remove"))
-        self.remove_button.setToolTip(_("Remove control layer"))
-        self.remove_button.setAutoRaise(True)
-        self.remove_button.clicked.connect(self.remove)
-
         bar_layout = QHBoxLayout()
         bar_layout.addWidget(self.mode_select)
         bar_layout.addWidget(self.layer_select, 3)
@@ -95,8 +85,16 @@ class ControlWidget(QWidget):
         bar_layout.addWidget(self.preset_slider, 1)
         bar_layout.addWidget(self.error_text, 3)
         bar_layout.addWidget(self.expand_button)
-        bar_layout.addWidget(self.remove_button)
         layout.addLayout(bar_layout)
+
+        if self._control_list is not None:
+            self.remove_button = QToolButton(self)
+            self.remove_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.remove_button.setIcon(theme.icon("remove"))
+            self.remove_button.setToolTip(_("Remove control layer"))
+            self.remove_button.setAutoRaise(True)
+            self.remove_button.clicked.connect(self.remove)
+            bar_layout.addWidget(self.remove_button)
 
         line = QFrame(self)
         line.setObjectName("LeftIndent")
@@ -184,6 +182,7 @@ class ControlWidget(QWidget):
             control.can_generate_changed.connect(self._update_visibility),
             control.mode_changed.connect(self._update_visibility),
             control.is_pose_vector_changed.connect(self._update_pose_utils),
+            root.active_model.style_changed.connect(self._update_visibility),
         ]
 
     def disconnect_all(self):
@@ -198,12 +197,13 @@ class ControlWidget(QWidget):
                 self.layer_select.addItem(layer.name, layer.id)
                 if layer.id == self._control.layer_id:
                     index = self.layer_select.count() - 1
-            if index == -1 and self._control in self._control_list:
+            if index == -1 and self._control_list and self._control in self._control_list:
                 self.remove()
-            else:
+            elif index >= 0:
                 self.layer_select.setCurrentIndex(index)
 
     def remove(self):
+        assert self._control_list is not None
         self._control_list.remove(self._control)
 
     def resizeEvent(self, a0: QResizeEvent | None):
@@ -214,18 +214,19 @@ class ControlWidget(QWidget):
         root.active_model.document.add_pose_character(self._control.layer)
 
     def _update_visibility(self):
-        is_small = self.width() < 450
+        is_small = self.width() < 420
         is_pose = self._control.mode is ControlMode.pose
+        is_edit = root.active_model.arch.is_edit
 
         def controls():
             self.layer_select.setVisible(self._control.is_supported)
-            self.preset_slider.setVisible(self._control.is_supported)
-            self.expand_button.setVisible(self._control.is_supported)
+            self.preset_slider.setVisible(self._control.is_supported and not is_edit)
+            self.expand_button.setVisible(self._control.is_supported and not is_edit)
             self.generate_button.setVisible(self._control.can_generate and is_small)
             self.generate_tool_button.setVisible(self._control.can_generate and not is_small)
             self.add_pose_button.setVisible(is_pose and is_small)
             self.add_pose_tool_button.setVisible(is_pose and not is_small)
-            if not self._control.is_supported:
+            if not self._control.is_supported or is_edit:
                 self.expand_button.setChecked(False)
 
         def error():
@@ -279,7 +280,7 @@ class ControlWidget(QWidget):
         self.error_text.setText(parts[0])
         if len(parts) > 1:
             self.error_text.setToolTip(
-                _("Missing one of the following models") + f": {parts[1][:-1]}"
+                _("Required model not found, searching for") + f": {parts[1][:-1]}"
             )
 
 

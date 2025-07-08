@@ -1,32 +1,34 @@
 from __future__ import annotations
+from copy import copy
 from enum import Enum
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 import json
 from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .api import CheckpointInput, LoraInput
 from .settings import Setting, settings
-from .resources import SDVersion
+from .resources import Arch
 from .localization import translate as _
-from .util import encode_json, read_json_with_comments
+from .util import encode_json, find_unused_path, read_json_with_comments
 from .util import plugin_dir, user_data_dir, client_logger as log
 
 
 class StyleSettings:
     name = Setting(_("Name"), _("Default Style"))
-    version = Setting("Version", 1)
+    version = Setting("Version", 2)
 
-    sd_version = Setting(
-        _("Stable Diffusion Version"),
-        SDVersion.auto,
-        _("The base architecture must match checkpoint and LoRA"),
+    architecture = Setting(
+        _("Diffusion Architecture"),
+        Arch.auto,
+        _("The base model ecosystem which the selected checkpoint belongs to."),
+        items=[Arch.auto] + Arch.list(),
     )
 
-    sd_checkpoint = Setting(
+    checkpoints = Setting(
         _("Model Checkpoint"),
-        "<no checkpoint set>",
-        _("The Stable Diffusion checkpoint file"),
+        [],
+        _("The Diffusion model checkpoint file"),
         _(
             "This has a large impact on which kind of content will be generated. To install additional checkpoints, place them into [ComfyUI]/models/checkpoints."
         ),
@@ -74,6 +76,8 @@ class StyleSettings:
         ),
     )
 
+    rescale_cfg = Setting("Rescale CFG", 0.7)
+
     self_attention_guidance = Setting(
         _("Enable SAG / Self-Attention Guidance"),
         False,
@@ -107,14 +111,15 @@ class Style:
     filepath: Path
     version: int = StyleSettings.version.default
     name: str = StyleSettings.name.default
-    sd_version: SDVersion = StyleSettings.sd_version.default
-    sd_checkpoint: str = StyleSettings.sd_checkpoint.default
-    loras: list[dict[str, str | float]]
+    architecture: Arch = StyleSettings.architecture.default
+    checkpoints: list[str] = StyleSettings.checkpoints.default
+    loras: list[dict[str, str | float | bool]]
     style_prompt: str = StyleSettings.style_prompt.default
     negative_prompt: str = StyleSettings.negative_prompt.default
     vae: str = StyleSettings.vae.default
     clip_skip: int = StyleSettings.clip_skip.default
     v_prediction_zsnr: bool = StyleSettings.v_prediction_zsnr.default
+    rescale_cfg: float = StyleSettings.rescale_cfg.default
     self_attention_guidance: bool = StyleSettings.self_attention_guidance.default
     preferred_resolution: int = StyleSettings.preferred_resolution.default
     sampler: str = StyleSettings.sampler.default
@@ -158,6 +163,8 @@ class Style:
             style.live_sampler = _map_sampler_preset(
                 filepath, style.live_sampler, style.live_sampler_steps, style.live_cfg_scale
             )
+            if "sd_checkpoint" in cfg:
+                style.checkpoints = [cfg["sd_checkpoint"]]
             return style
         except json.JSONDecodeError as e:
             log.warning(f"Failed to load style {filepath}: {e}")
@@ -169,21 +176,28 @@ class Style:
             for name, setting in StyleSettings.__dict__.items()
             if isinstance(setting, Setting)
         }
+        cfg["version"] = StyleSettings.version.default
         self.filepath.write_text(json.dumps(cfg, indent=4, default=encode_json))
 
     @property
     def filename(self):
         if self.filepath.is_relative_to(Styles.default_user_folder):
             return str(self.filepath.relative_to(Styles.default_user_folder).as_posix())
-        return f"built-in/{self.filepath.name}"
+        if self.filepath.is_relative_to(Styles.default_builtin_folder):
+            return f"built-in/{self.filepath.name}"
+        return self.filepath.name
 
-    def get_models(self):
+    def preferred_checkpoint(self, available_checkpoints: Iterable[str]):
+        return next((c for c in self.checkpoints if c in available_checkpoints), "not-found")
+
+    def get_models(self, available_checkpoints: Iterable[str]):
         result = CheckpointInput(
-            checkpoint=self.sd_checkpoint,
+            checkpoint=self.preferred_checkpoint(available_checkpoints),
             vae=self.vae,
             clip_skip=self.clip_skip,
             v_prediction_zsnr=self.v_prediction_zsnr,
-            loras=[LoraInput.from_dict(l) for l in self.loras],
+            rescale_cfg=self.rescale_cfg,
+            loras=[LoraInput.from_dict(l) for l in self.loras if l.get("enabled", True)],
             self_attention_guidance=self.self_attention_guidance,
         )
         return result
@@ -238,18 +252,18 @@ class Styles(QObject):
     def default(self):
         return self[0]
 
-    def create(self, name: str = "style", checkpoint: str = "") -> Style:
-        if Path(self.user_folder / f"{name}.json").exists():
-            i = 1
-            basename = name
-            while Path(self.user_folder / f"{basename}_{i}.json").exists():
-                i += 1
-            name = f"{basename}_{i}"
-
-        new_style = Style(self.user_folder / f"{name}.json")
+    def create(self, filename="style.json", checkpoint: str = "", copy_from: Style | None = None):
+        filename = Path(filename).name
+        path = find_unused_path(self.user_folder / filename)
+        new_style = Style(path)
         new_style.name = _("New Style")
         if checkpoint:
-            new_style.sd_checkpoint = checkpoint
+            new_style.checkpoints = [checkpoint]
+        if copy_from:
+            for name, setting in StyleSettings.__dict__.items():
+                if isinstance(setting, Setting):
+                    setattr(new_style, name, copy(getattr(copy_from, name)))
+            new_style.name = f"{copy_from.name} (Copy)"
         self._list.append(new_style)
         new_style.save()
         self.changed.emit()
@@ -433,7 +447,7 @@ _scheduler_map = {
     "Euler a": "normal",
 }
 _sampler_presets_stub = """// Custom sampler presets - add your own sampler presets here!
-// https://github.com/Acly/krita-ai-diffusion/wiki/Samplers
+// https://docs.interstice.cloud/samplers
 //
 // *** You have to restart Krita for the changes to take effect! ***
 {

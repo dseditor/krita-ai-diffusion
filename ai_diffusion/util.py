@@ -1,21 +1,26 @@
-from enum import Enum
+from enum import Enum, Flag
+from dataclasses import asdict, is_dataclass
 from itertools import islice
 from pathlib import Path
+from typing import Generator
 import asyncio
 import importlib.util
 import os
 import subprocess
 import sys
 import json
+import locale
 import logging
 import logging.handlers
 import statistics
 import zipfile
-from typing import Callable, Iterable, Optional, Sequence, TypeVar
-from PyQt5.QtCore import QStandardPaths
+from typing import Any, Callable, Iterable, Optional, Sequence, TypeVar
+from PyQt5 import sip
+from PyQt5.QtCore import QObject, QStandardPaths
 
 T = TypeVar("T")
 R = TypeVar("R")
+QOBJECT = TypeVar("QOBJECT", bound=QObject)
 
 is_windows = sys.platform.startswith("win")
 is_macos = sys.platform == "darwin"
@@ -38,7 +43,7 @@ def _get_user_data_dir():
             dir = dir / "krita-ai-diffusion"
         dir.mkdir(exist_ok=True)
         return dir
-    except Exception as e:
+    except Exception:
         return Path(__file__).parent
 
 
@@ -118,9 +123,29 @@ def median_or_zero(values: Iterable[float]) -> float:
         return 0
 
 
+def isnumber(x):
+    return isinstance(x, (int, float))
+
+
+def base_type_match(a, b):
+    return type(a) is type(b) or (isnumber(a) and isnumber(b))
+
+
 def unique(seq: Sequence[T], key) -> list[T]:
     seen = set()
     return [x for x in seq if (k := key(x)) not in seen and not seen.add(k)]
+
+
+def flatten(seq: Sequence[T | list[T]]) -> Generator[T, None, None]:
+    for x in seq:
+        if isinstance(x, list):
+            yield from x
+        else:
+            yield x
+
+
+def sequence_equal(a: Sequence[T], b: Sequence[T]) -> bool:
+    return len(a) == len(b) and all(x == y for x, y in zip(a, b))
 
 
 def trim_text(text: str, max_length: int) -> str:
@@ -129,9 +154,16 @@ def trim_text(text: str, max_length: int) -> str:
     return text
 
 
-def encode_json(obj):
+def encode_json(obj: Any):
+    if isinstance(obj, Flag):
+        return obj.value
     if isinstance(obj, Enum):
         return obj.name
+    if isinstance(obj, Path):
+        return str(obj.as_posix())
+    if is_dataclass(obj):
+        assert not isinstance(obj, type)
+        return asdict(obj)
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
 
@@ -175,6 +207,7 @@ async def create_process(
     cwd: Path | None = None,
     additional_env: dict | None = None,
     pipe_stderr=False,
+    is_job=False,
 ):
     platform_args = {}
     if is_windows:
@@ -194,14 +227,47 @@ async def create_process(
     p = await asyncio.create_subprocess_exec(
         program, *args, cwd=cwd, stdout=out, stderr=err, env=env, **platform_args
     )
-    if is_windows:
+    if is_windows and is_job:
         try:
             from . import win32
 
             win32.attach_process_to_job(p.pid)
         except Exception as e:
-            client_logger.error(f"Failed to attach process to job: {e}")
+            client_logger.warning(f"Failed to attach process to job: {e}")
     return p
+
+
+_system_encoding = locale.getpreferredencoding(False)
+_system_encoding_initialized = not is_windows
+
+
+async def determine_system_encoding(python_cmd: str):
+    """Windows: Krita's embedded Python always reports UTF-8, even if the system
+    uses a different encoding (likely). To decode subprocess output correctly,
+    the encoding used by an outside process must be determined."""
+    global _system_encoding
+    global _system_encoding_initialized
+    if _system_encoding_initialized:
+        return
+    try:
+        _system_encoding_initialized = True  # only try once
+        result = await create_process(
+            python_cmd, "-c", "import locale; print(locale.getpreferredencoding(False))"
+        )
+        out, err = await result.communicate()
+        if out:
+            enc = out.decode().strip()
+            b"test".decode(enc)
+            _system_encoding = enc
+            client_logger.info(f"System locale encoding determined: {_system_encoding}")
+        else:
+            client_logger.warning(f"Failed to determine system locale: {err}")
+    except Exception as e:
+        client_logger.warning(f"Failed to determine system locale: {e}")
+
+
+def decode_pipe_bytes(data: bytes) -> str:
+    return data.decode(_system_encoding, errors="replace")
 
 
 class LongPathZipFile(zipfile.ZipFile):
@@ -218,3 +284,15 @@ class LongPathZipFile(zipfile.ZipFile):
 
 
 ZipFile = LongPathZipFile if is_windows else zipfile.ZipFile
+
+
+def acquire_elements(l: list[QOBJECT]) -> list[QOBJECT]:
+    # Many Pykrita functions return a `QList<QObject*>` where the objects are
+    # allocated for the caller. SIP does not handle this case and just leaks
+    # the objects outright. Fix this by taking explicit ownership of the objects.
+    # Note: ONLY call this if you are confident that the Pykrita function
+    # allocates the list members!
+    for obj in l:
+        if obj is not None:
+            sip.transferback(obj)
+    return l

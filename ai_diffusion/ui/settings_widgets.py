@@ -17,24 +17,28 @@ from PyQt5.QtWidgets import (
     QScrollArea,
     QFrame,
 )
-from PyQt5.QtCore import Qt, QSize, pyqtSignal
+from PyQt5.QtCore import Qt, QAbstractItemModel, QSize, pyqtSignal
 from PyQt5.QtGui import QIcon
 
 from ..localization import translate as _
 from ..settings import Setting, settings
-from ..util import ensure
 from .switch import SwitchWidget
 from .theme import add_header, icon
 
 
 class ExpanderButton(QToolButton):
-    def __init__(self, text, parent=None):
+    def __init__(self, text: str | None = None, parent=None):
         super().__init__(parent)
         self.setCheckable(True)
         self.setIconSize(QSize(8, 8))
         self.setStyleSheet("QToolButton { border: none; font-weight: bold }")
-        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.setText(" " + text)
+        if text is not None:
+            self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            self.setText(" " + text)
+        else:
+            self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.setMinimumHeight(24)
+            self.setMinimumWidth(18)
         self._toggle(False)
         self.toggled.connect(self._toggle)
 
@@ -45,8 +49,8 @@ class ExpanderButton(QToolButton):
 class WarningIcon(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
-        font_height = int(1.2 * self.fontMetrics().height())
-        warning_icon = icon("warning").pixmap(font_height, font_height)
+        self.icon_size = int(1.2 * self.fontMetrics().height())
+        warning_icon = icon("warning").pixmap(self.icon_size, self.icon_size)
         self.setPixmap(warning_icon)
         self.setVisible(False)
 
@@ -61,21 +65,23 @@ class WarningIcon(QLabel):
 class SettingWidget(QWidget):
     value_changed = pyqtSignal()
 
-    _checkbox: QCheckBox | None = None
-    _layout: QHBoxLayout
-    _widget: QWidget
-
     def __init__(self, setting: Setting, parent=None):
         super().__init__(parent)
 
         self._key_label = QLabel(f"<b>{setting.name}</b><br>{setting.desc}")
         self._key_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
+        self._checkbox: QCheckBox | None = None
+        self._widget: QWidget | None = None
+
+        self._indent = 0
+        self._show_label = True
         self._layout = QHBoxLayout()
-        self._layout.setContentsMargins(0, 2, 0, 2)
+        self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.addWidget(self._key_label)
         self._layout.addStretch(1)
         self.setLayout(self._layout)
+        self._set_margins()
 
     def set_widget(self, widget: QWidget):
         self._widget = widget
@@ -90,8 +96,10 @@ class SettingWidget(QWidget):
         self._layout.addWidget(button)
 
     def add_checkbox(self, text: str):
+        widget = self._widget
+        assert widget is not None
         checkbox = self._checkbox = QCheckBox(text, self)
-        checkbox.toggled.connect(lambda v: self._widget.setEnabled(v))
+        checkbox.toggled.connect(lambda v: widget.setEnabled(v))
         self._layout.removeWidget(self._widget)
         self._layout.addWidget(checkbox)
         self._layout.addWidget(self._widget)
@@ -107,24 +115,39 @@ class SettingWidget(QWidget):
 
     @property
     def enabled(self):
-        return self._widget.isEnabled()
+        return self._widget and self._widget.isEnabled()
 
     @enabled.setter
     def enabled(self, v: bool):
-        self._widget.setEnabled(v)
+        if self._widget is not None:
+            self._widget.setEnabled(v)
         if self._checkbox is not None:
             self._checkbox.setChecked(v)
 
     @property
     def indent(self):
-        return self._layout.contentsMargins().left() / 16
+        return self._indent
 
     @indent.setter
     def indent(self, v: int):
-        self._layout.setContentsMargins(v * 16, 2, 0, 2)
+        self._indent = v
+        self._set_margins()
+
+    @property
+    def show_label(self):
+        return self._show_label
+
+    @show_label.setter
+    def show_label(self, v: bool):
+        self._show_label = v
+        self._key_label.setVisible(v)
+        self._set_margins()
 
     def _notify_value_changed(self):
         self.value_changed.emit()
+
+    def _set_margins(self):
+        self.setContentsMargins(self._indent * 16, 4 if self._show_label else 0, 0, 0)
 
 
 class FileListSetting(SettingWidget):
@@ -151,7 +174,7 @@ class FileListSetting(SettingWidget):
     def _set_files(self, files: list[str]):
         files = sorted(files, key=lambda x: x.lower())
         self._files = files
-        for _, w in self._list_items:
+        for f, w in self._list_items:
             self._list_layout.removeWidget(w)
         if item := self._list_layout.itemAt(0):
             self._list_layout.removeItem(item)
@@ -265,17 +288,19 @@ class ComboBoxSetting(SettingWidget):
     _enum_type = None
     _original_text = ""
 
-    def __init__(self, setting: Setting, parent=None):
+    def __init__(self, setting: Setting, model: QAbstractItemModel | None = None, parent=None):
         super().__init__(setting, parent)
         self._combo = QComboBox(self)
-        if isinstance(setting.default, Enum):
-            self._enum_type = type(setting.default)
-            self.set_items(self._enum_type)
+        if model is not None:
+            self._combo.setModel(model)
         elif setting.items:
             self.set_items(setting.items)
+        elif isinstance(setting.default, Enum):
+            self._enum_type = type(setting.default)
+            self.set_items(self._enum_type)
 
         self._combo.setMinimumWidth(230)
-        self._combo.currentIndexChanged.connect(self._change_value)
+        self._combo.activated.connect(self._change_value)
         self.set_widget(self._combo)
         self._original_text = self._key_label.text()
 
@@ -289,6 +314,9 @@ class ComboBoxSetting(SettingWidget):
             for name in items:
                 if isinstance(name, str):
                     self._combo.addItem(name, name)
+                elif isinstance(name, Enum):
+                    self._combo.addItem(name.value, name.name)
+                    self._enum_type = type(name)
                 elif len(name) == 2:
                     self._combo.addItem(name[0], name[1])
                 elif len(name) == 3:
@@ -460,6 +488,8 @@ class SettingsWriteGuard:
 
 def _add_title(layout: QVBoxLayout, title: str):
     title_label = QLabel(title)
-    title_label.setStyleSheet("font-size: 12pt")
+    font = title_label.font()
+    font.setPointSize(font.pointSize() + 2)
+    title_label.setFont(font)
     layout.addWidget(title_label)
     layout.addSpacing(6)

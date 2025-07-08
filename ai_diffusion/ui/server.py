@@ -15,22 +15,26 @@ from PyQt5.QtWidgets import (
     QFrame,
     QLabel,
     QLineEdit,
+    QMenu,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QToolButton,
     QScrollArea,
 )
+from ai_diffusion.network import DownloadProgress
 from krita import Krita
 
 from ..settings import Settings, ServerMode, settings
-from ..style import SDVersion
+from ..style import Arch
 from ..resources import ModelResource, CustomNode
 from ..server import Server, ServerBackend, ServerState
 from ..connection import ConnectionState
 from ..root import root
 from ..localization import translate as _
+from ..util import ensure
 from .. import eventloop, resources, server, util
-from .theme import add_header, set_text_clipped, green, grey, red, yellow, highlight
+from .theme import SignalBlocker, add_header, set_text_clipped, green, grey, red, yellow, highlight
 
 
 class PackageState(Enum):
@@ -52,7 +56,7 @@ class PackageGroupWidget(QWidget):
     _items: list[PackageItem]
     _status: QLabel
     _desc: Optional[QLabel] = None
-    _workload = SDVersion.all
+    _workload = Arch.all
     _is_checkable = False
 
     changed = pyqtSignal()
@@ -156,15 +160,18 @@ class PackageGroupWidget(QWidget):
                 elif item.state is PackageState.disabled:
                     item.status.setText(_("Workload not selected"))
                     item.status.setStyleSheet(f"color:{grey}")
-                item.status.setChecked(
-                    item.state in [PackageState.selected, PackageState.installed]
-                )
-                item.status.setEnabled(item.state is not PackageState.disabled)
+                with SignalBlocker(item.status):
+                    item.status.setChecked(
+                        item.state in [PackageState.selected, PackageState.installed]
+                    )
+                    item.status.setEnabled(item.state is not PackageState.disabled)
         self._update_status()
 
     def _update_workload(self, item: PackageItem):
-        enabled = not isinstance(item.package, ModelResource) or SDVersion.match(
-            self._workload, item.package.sd_version
+        enabled = (
+            not isinstance(item.package, ModelResource)
+            or Arch.match(self._workload, item.package.arch)
+            or item.package.arch not in [Arch.sd15, Arch.sdxl]
         )
         if not enabled and item.state in [PackageState.selected, PackageState.available]:
             item.state = PackageState.disabled
@@ -188,7 +195,7 @@ class PackageGroupWidget(QWidget):
         return self._workload
 
     @workload.setter
-    def workload(self, workload: SDVersion):
+    def workload(self, workload: Arch):
         self._workload = workload
         self._update()
 
@@ -241,8 +248,7 @@ class ServerWidget(QWidget):
         super().__init__(parent)
         self._server = srv
 
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+        layout = QVBoxLayout(self)
 
         add_header(layout, Settings._server_path)
 
@@ -281,6 +287,20 @@ class ServerWidget(QWidget):
         self._launch_button.setMinimumHeight(35)
         self._launch_button.clicked.connect(self._launch)
 
+        self._manage_button = QToolButton(self)
+        self._manage_button.setText(_("Manage"))
+        self._manage_button.setPopupMode(QToolButton.InstantPopup)
+        self._manage_button.setMinimumWidth(150)
+
+        menu = QMenu(self)
+        verify_action = menu.addAction(_("Verify"))
+        ensure(verify_action).triggered.connect(self.verify_models)
+        reinstall_action = menu.addAction(_("Re-install"))
+        ensure(reinstall_action).triggered.connect(self.reinstall)
+        delete_action = menu.addAction(_("Delete"))
+        ensure(delete_action).triggered.connect(self.uninstall)
+        self._manage_button.setMenu(menu)
+
         anchor = _("View log files")
         open_log_button = QLabel(f"<a href='file://{util.log_dir}'>{anchor}</a>", self)
         open_log_button.setToolTip(str(util.log_dir))
@@ -295,6 +315,7 @@ class ServerWidget(QWidget):
 
         buttons_layout = QVBoxLayout()
         buttons_layout.addWidget(self._launch_button)
+        buttons_layout.addWidget(self._manage_button)
         buttons_layout.addWidget(open_log_button, 0, Qt.AlignmentFlag.AlignRight)
 
         launch_layout = QHBoxLayout()
@@ -326,50 +347,60 @@ class ServerWidget(QWidget):
             _("Workloads"),
             [_("Stable Diffusion 1.5"), _("Stable Diffusion XL")],
             description=(
-                _("Choose one or both Stable Diffusion versions to work with.")
-                + " <a href='https://github.com/Acly/krita-ai-diffusion/wiki/Stable-Diffusion-Versions'>"
+                _("Choose a Diffusion base model to install its basic requirements.")
+                + " <a href='https://docs.interstice.cloud/base-models'>"
                 + _("Read more about workloads.")
                 + "</a>"
             ),
             is_checkable=True,
             parent=self,
         )
+        self._workload_group.values = [PackageState.available, PackageState.selected]
         self._workload_group.changed.connect(self.update_ui)
         package_layout.addWidget(self._workload_group)
 
+        optional_models = resources.default_checkpoints + resources.optional_models
         self._packages = {
-            "checkpoints": PackageGroupWidget(
-                _("Recommended checkpoints"),
-                [c for c in resources.default_checkpoints if c.sd_version is not SDVersion.flux],
-                description=(
-                    _(
-                        "At least one Stable Diffusion checkpoint is required. Below are some popular choices, more can be found online."
-                    )
-                ),
-                is_checkable=True,
-                initial=PackageState.available if self._server.has_comfy else PackageState.selected,
-                parent=self,
-            ),
             "upscalers": PackageGroupWidget(
                 _("Upscalers (super-resolution)"),
                 resources.upscale_models,
                 is_checkable=True,
                 parent=self,
             ),
-            "control_sd15": PackageGroupWidget(
-                _("Control extensions for SD 1.5"),
-                [m for m in resources.optional_models if m.sd_version is SDVersion.sd15],
+            "sd15": PackageGroupWidget(
+                _("Stable Diffusion 1.5 models"),
+                [m for m in optional_models if m.arch is Arch.sd15],
+                description=_("Select at least one diffusion model. Control models are optional."),
+                is_checkable=True,
+                is_expanded=False,
+                parent=self,
+            ),
+            "sdxl": PackageGroupWidget(
+                _("Stable Diffusion XL models"),
+                [m for m in optional_models if m.arch is Arch.sdxl],
+                description=_("Select at least one diffusion model. Control models are optional."),
                 is_checkable=True,
                 parent=self,
             ),
-            "control_sdxl": PackageGroupWidget(
-                _("Control extensions for SD XL"),
-                [m for m in resources.optional_models if m.sd_version is SDVersion.sdxl],
+            "illu": PackageGroupWidget(
+                _("Illustrious/NoobAI XL models"),
+                [m for m in optional_models if m.arch in [Arch.illu, Arch.illu_v]],
+                description=_("Select at least one diffusion model. Control models are optional."),
                 is_checkable=True,
+                is_expanded=False,
                 parent=self,
             ),
         }
-        for group in ["checkpoints", "upscalers", "control_sd15", "control_sdxl"]:
+        # Pre-select a recommended set of models if the server hasn't been installed yet
+        if not self._server.has_comfy and self.selected_workload in [Arch.all, Arch.sdxl]:
+            sdxl_packages = self._packages["sdxl"]
+            sdxl_packages.workload = Arch.sdxl
+            state = [PackageState.selected for _ in sdxl_packages.values]
+            state[-2] = PackageState.available  # Stencil is optional
+            state[-1] = PackageState.available  # Face model is optional
+            sdxl_packages.values = state
+
+        for group in ["upscalers", "sd15", "sdxl", "illu"]:
             self._packages[group].changed.connect(self.update_ui)
             package_layout.addWidget(self._packages[group])
 
@@ -408,7 +439,7 @@ class ServerWidget(QWidget):
         backends = ServerBackend.supported()
         try:
             backend = backends[self._backend_select.currentIndex()]
-        except:
+        except Exception:
             backend = backends[0]
         if settings.server_backend != backend:
             self._server.backend = backend
@@ -497,15 +528,17 @@ class ServerWidget(QWidget):
             await self._stop()
 
         self._launch_button.setEnabled(False)
+        self._manage_button.setEnabled(False)
         self._status_label.setStyleSheet(f"color:{highlight};font-weight:bold")
         self._backend_select.setVisible(False)
         self._progress_bar.setVisible(True)
         self._progress_info.setVisible(True)
+        self._progress_info.setText("")
 
     def _handle_progress(self, report: server.InstallationProgress):
         self._status_label.setText(f"{report.stage}...")
         set_text_clipped(self._progress_info, report.message)
-        if report.progress and report.progress.total > 0:
+        if isinstance(report.progress, DownloadProgress) and report.progress.total > 0:
             self._progress_bar.setMaximum(100)
             self._progress_bar.setValue(int(report.progress.value * 100))
             self._progress_bar.setFormat(
@@ -513,52 +546,157 @@ class ServerWidget(QWidget):
                 f" {report.progress.speed:.1f} MB/s"
             )
             self._progress_bar.setTextVisible(True)
-        elif report.progress:  # download, but unknown total size
+        elif isinstance(report.progress, DownloadProgress):  # download, but unknown total size
             self._progress_bar.setMaximum(0)
             self._progress_bar.setValue(0)
             self._progress_bar.setFormat(
                 f"{report.progress.received:.0f} MB - {report.progress.speed:.1f} MB/s"
             )
             self._progress_bar.setTextVisible(True)
+        elif isinstance(report.progress, tuple):
+            self._progress_bar.setMinimum(0)
+            self._progress_bar.setMaximum(report.progress[1])
+            self._progress_bar.setValue(report.progress[0])
+            self._progress_bar.setFormat(f"{report.progress[0]} / {report.progress[1]}")
+            self._progress_bar.setTextVisible(True)
         else:
             self._progress_bar.setMaximum(0)
             self._progress_bar.setValue(0)
             self._progress_bar.setTextVisible(False)
+
+    def verify_models(self):
+        eventloop.run(self._verify_models())
+
+    async def _verify_models(self):
+        await self._prepare_for_install()
+        try:
+            bad_models = await self._server.verify(self._handle_progress)
+
+            if not bad_models:
+                QMessageBox.information(
+                    self,
+                    _("Verification Complete"),
+                    _("All model files were verified successfully."),
+                )
+            else:
+                failed_files = "\n".join([
+                    f"• {status.file.path} - {status.info or status.state.name}"
+                    for status in bad_models
+                ])
+
+                msg_box = QMessageBox(
+                    QMessageBox.Warning,
+                    _("Verification Failed"),
+                    _("The following files failed verification:")
+                    + f"\n\n{failed_files}\n\n"
+                    + _("Would you like to delete and re-download these files?"),
+                    QMessageBox.Yes | QMessageBox.No,
+                    self,
+                )
+
+                if msg_box.exec_() == QMessageBox.Yes:
+                    await self._server.fix_models(bad_models, self._handle_progress)
+        except Exception as e:
+            self.show_error(str(e))
+        finally:
+            self._progress_bar.setVisible(False)
+            self._progress_info.setVisible(False)
+            self.update_ui()
+
+    def reinstall(self):
+        eventloop.run(self._reinstall())
+
+    async def _reinstall(self):
+        msg_box = QMessageBox(
+            QMessageBox.Question,
+            _("Confirm Reinstallation"),
+            _(
+                "This will reinstall the server components while keeping your downloaded models. Continue?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            self,
+        )
+
+        if msg_box.exec_() != QMessageBox.Yes:
+            return
+
+        await self._prepare_for_install()
+        try:
+            await self._server.uninstall(self._handle_progress, delete_models=False)
+            await self._server.install(self._handle_progress)
+            await self._server.download_required(self._handle_progress)
+        except Exception as e:
+            self.show_error(str(e))
+        finally:
+            self.update_ui()
+
+    def uninstall(self):
+        eventloop.run(self._uninstall())
+
+    async def _uninstall(self):
+        msg_box = QMessageBox(
+            QMessageBox.Warning,
+            _("Confirm Deletion"),
+            _("WARNING: This will delete the entire server installation INCLUDING ALL MODELS!")
+            + "\n\n"
+            + _("This action cannot be undone.")
+            + "\n\n"
+            + _("Are you absolutely sure you want to continue?"),
+            QMessageBox.Cancel,
+            self,
+        )
+        msg_box.addButton(_("Delete"), QMessageBox.DestructiveRole)
+        msg_box.setDefaultButton(QMessageBox.Cancel)
+        if msg_box.exec_() != 0:  # Destructive role returns 0
+            return
+
+        await self._prepare_for_install()
+        try:
+            await self._server.uninstall(self._handle_progress, delete_models=True)
+        except Exception as e:
+            self.show_error(str(e))
+        finally:
+            self._progress_bar.setVisible(False)
+            self._progress_info.setVisible(False)
+            self.update_ui()
 
     def update_ui(self):
         self._location_edit.setText(settings.server_path)
         backends = ServerBackend.supported()
         try:
             index = backends.index(settings.server_backend)
-        except:
+        except Exception:
             index = 0
         self._backend_select.setCurrentIndex(index)
         self._progress_bar.setVisible(False)
         self._progress_info.setVisible(False)
         self._backend_select.setVisible(True)
         self._launch_button.setEnabled(True)
+        self._manage_button.setEnabled(True)
         self._location_edit.setEnabled(True)
 
         state = self._server.state
         if state is ServerState.not_installed:
             self._status_label.setText(_("Server is not installed"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
+            self._manage_button.setEnabled(False)
         elif state is ServerState.missing_resources:
             self._status_label.setText(_("Server is missing required components"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
-        elif state is ServerState.installing:
+            self._manage_button.setEnabled(False)
+        elif state in [ServerState.installing, ServerState.verifying, ServerState.uninstalling]:
             self._location_edit.setEnabled(False)
             self._progress_bar.setVisible(True)
             self._progress_info.setVisible(True)
             self._backend_select.setVisible(False)
             self._launch_button.setEnabled(False)
+            self._manage_button.setEnabled(False)
         elif self._server.upgrade_required:
             self._status_label.setText(
                 _("Upgrade required") + f": v{self._server.version} -> v{resources.version}"
             )
             self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
             self._launch_button.setText(_("Upgrade"))
-            self._launch_button.setEnabled(True)
         elif state is ServerState.stopped:
             self._status_label.setText(_("Server stopped"))
             self._status_label.setStyleSheet(f"color:{red};font-weight:bold")
@@ -568,6 +706,7 @@ class ServerWidget(QWidget):
             self._status_label.setStyleSheet(f"color:{yellow};font-weight:bold")
             self._launch_button.setText(_("Launch"))
             self._launch_button.setEnabled(False)
+            self._manage_button.setEnabled(False)
             self._location_edit.setEnabled(False)
         elif state is ServerState.running:
             connection_state = root.connection.state
@@ -606,7 +745,8 @@ class ServerWidget(QWidget):
     def show_error(self, error: str):
         self._error = error
         if self._error:
-            self._status_label.setText(f"<b>Error:</b> {self._error}")
+            error_text = "<b>Error:</b> " + self._error.replace("\n", "<br>")
+            self._status_label.setText(error_text)
             self._status_label.setStyleSheet(f"color:{red}")
 
     def update_required(self):
@@ -616,7 +756,7 @@ class ServerWidget(QWidget):
         has_missing_models = any(
             model.name in self._server.missing_resources
             for model in resources.required_models
-            if model.sd_version is SDVersion.all
+            if model.arch is Arch.all
         )
         installed_status = [
             self._server.has_python,
@@ -628,12 +768,10 @@ class ServerWidget(QWidget):
 
     def update_optional(self):
         workloads = [
-            [m for m in resources.required_models if m.sd_version is SDVersion.sd15],
-            [m for m in resources.required_models if m.sd_version is SDVersion.sdxl],
+            [m for m in resources.required_models if m.arch is Arch.sd15],
+            [m for m in resources.required_models if m.arch is Arch.sdxl],
         ]
         self._workload_group.set_installed([self._server.all_installed(w) for w in workloads])
-        if all(state is PackageState.available for state in self._workload_group.values):
-            self._workload_group.values = [PackageState.selected, PackageState.available]
         to_install = [
             m.name
             for workload, state in zip(workloads, self._workload_group.values)
@@ -665,9 +803,9 @@ class ServerWidget(QWidget):
             for state in self._workload_group.values
         ]
         if all(selected_or_installed):
-            return SDVersion.all
+            return Arch.all
         if selected_or_installed[0]:
-            return SDVersion.sd15
+            return Arch.sd15
         if selected_or_installed[1]:
-            return SDVersion.sdxl
-        assert False, "No workload selected!"
+            return Arch.sdxl
+        return Arch.auto

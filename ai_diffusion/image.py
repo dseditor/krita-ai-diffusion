@@ -1,7 +1,7 @@
 from __future__ import annotations
 from enum import Enum
-from math import ceil, sqrt
-from PyQt5.QtGui import QImage, QImageWriter, QPixmap, QIcon, QPainter, QColorSpace
+from math import sqrt
+from PyQt5.QtGui import QImage, QImageWriter, QImageReader, QPixmap, QIcon, QPainter, QColorSpace
 from PyQt5.QtGui import qRgba, qRed, qGreen, qBlue, qAlpha, qGray
 from PyQt5.QtCore import Qt, QByteArray, QBuffer, QRect, QSize, QFile, QIODevice
 from typing import Callable, Iterable, SupportsIndex, Tuple, NamedTuple, Union, Optional
@@ -142,7 +142,7 @@ class Bounds(NamedTuple):
 
     @property
     def is_zero(self):
-        return self.width == 0 and self.height == 0
+        return self.width * self.height == 0
 
     def is_within(self, x: int, y: int):
         return x >= 0 and x < self.width and y >= 0 and y < self.height
@@ -202,8 +202,8 @@ class Bounds(NamedTuple):
         """Restrict bounds to be inside another bounds."""
         x = max(within.x, bounds.x)
         y = max(within.y, bounds.y)
-        width = min(within.x + within.width, bounds.x + bounds.width) - x
-        height = min(within.y + within.height, bounds.y + bounds.height) - y
+        width = max(0, min(within.x + within.width, bounds.x + bounds.width) - x)
+        height = max(0, min(within.y + within.height, bounds.y + bounds.height) - y)
         return Bounds(x, y, width, height)
 
     @staticmethod
@@ -295,10 +295,17 @@ class ImageFileFormat(Enum):
         return self
 
 
+_qt_supports_webp = None
+
+
+def qt_supports_webp():
+    global _qt_supports_webp
+    if _qt_supports_webp is None:
+        _qt_supports_webp = QByteArray(b"webp") in QImageWriter.supportedImageFormats()
+    return _qt_supports_webp
+
+
 class Image:
-
-    _qt_supports_webp = True
-
     def __init__(self, qimage: QImage):
         self._qimage = qimage
 
@@ -315,6 +322,14 @@ class Image:
         if fill is not None:
             img._qimage.fill(fill)
         return img
+
+    @staticmethod
+    def from_packed_bytes(data: QByteArray, extent: Extent, channels=4):
+        assert channels == 4 or channels == 1
+        stride = extent.width * channels
+        format = QImage.Format.Format_ARGB32 if channels == 4 else QImage.Format.Format_Grayscale8
+        qimg = QImage(data, extent.width, extent.height, stride, format)
+        return Image(qimg)
 
     @staticmethod
     def copy(image: "Image"):
@@ -351,10 +366,24 @@ class Image:
         return Image.from_bytes(bytes)
 
     @staticmethod
-    def from_bytes(data: QByteArray | memoryview, format: str | None = None):
-        img = QImage.fromData(data, format)
-        assert img and not img.isNull(), "Failed to load image from memory"
-        return Image(img)
+    def from_bytes(data: QBuffer | QByteArray | memoryview, format: str | None = None):
+        if isinstance(data, QBuffer):
+            buffer = data
+        else:
+            if not isinstance(data, QByteArray):
+                data = QByteArray(bytearray(data))
+            buffer = QBuffer(data)
+            buffer.open(QBuffer.OpenModeFlag.ReadOnly)
+        if format:
+            loader = QImageReader(buffer, format.encode("utf-8"))
+        else:
+            loader = QImageReader(buffer)
+
+        img = QImage()
+        if loader.read(img):
+            return Image(img)
+        else:
+            raise Exception(f"Failed to load image from buffer: {loader.errorString()}")
 
     @staticmethod
     def from_pil(pil_image):
@@ -475,7 +504,7 @@ class Image:
 
     def write(self, buffer: QIODevice, format=ImageFileFormat.png):
         # Compression takes time for large images and blocks the UI, might be worth to thread.
-        if not self._qt_supports_webp:
+        if not qt_supports_webp():
             format = format.no_webp_fallback
         format_str, quality = format.value
         writer = QImageWriter(buffer, QByteArray(format_str.encode("utf-8")))
@@ -487,7 +516,8 @@ class Image:
                 log.warning(
                     "To enable support for writing webp images, you may need to install the 'qt5-imageformats' package."
                 )
-                Image._qt_supports_webp = False
+                global _qt_supports_webp
+                _qt_supports_webp = False
                 self.write(buffer, format.no_webp_fallback)
             raise Exception(f"Failed to write image to buffer: {writer.errorString()} {info}")
 
@@ -641,16 +671,12 @@ class ImageCollection:
         buffer.open(QBuffer.OpenModeFlag.ReadOnly)
         for i, offset in enumerate(offsets):
             buffer.seek(offset)
-            img = QImage()
-            if img.load(buffer, None):
-                images.append(Image(img))
-            else:
-                raise Exception(f"Failed to load image {i} from buffer")
+            images.append(Image.from_bytes(buffer))
         buffer.close()
         return images
 
-    def to_base64(self):
-        bytes, offsets = self.to_bytes()
+    def to_base64(self, format=ImageFileFormat.png):
+        bytes, offsets = self.to_bytes(format)
         return bytes.toBase64().data().decode("utf-8"), offsets
 
     @staticmethod
@@ -669,26 +695,18 @@ class ImageCollection:
 
 
 class Mask:
-    _data: Optional[QByteArray]
-
-    bounds: Bounds
-    image: QImage
-
     def __init__(self, bounds: Bounds, data: Union[QImage, QByteArray]):
         self.bounds = bounds
         if isinstance(data, QImage):
-            self.image = data
+            self.image: QImage = data
         else:
             assert len(data) == bounds.width * bounds.height
-            self._data = data
-            self.image = QImage(
-                data.data(),
-                bounds.width,
-                bounds.height,
-                bounds.width,
-                QImage.Format.Format_Grayscale8,
-            )
+            self.image = Image.from_packed_bytes(data, bounds.extent, channels=1)._qimage
             assert not self.image.isNull()
+
+    @staticmethod
+    def transparent(bounds: Bounds):
+        return Mask(bounds, QByteArray(bytes(bounds.width * bounds.height)))
 
     @staticmethod
     def rectangle(bounds: Bounds, feather=0):

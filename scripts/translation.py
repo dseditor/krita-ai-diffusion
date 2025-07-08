@@ -1,10 +1,10 @@
 import argparse
-import regex as re
+import re
 import json
 from pathlib import Path
 
 source_dir = Path(__file__).parent.parent / "ai_diffusion"
-excluded_dirs = [".pytest_cache", "__pycache__", "icons", "websockets"]
+excluded_dirs = [".pytest_cache", "__pycache__", "icons", "websockets", "debugpy"]
 expression = re.compile(r'_\(\s*"(.+?)"[\,|\s*\)]')
 
 
@@ -13,10 +13,10 @@ def extract_source_strings(filepath: Path):
     return set(expression.findall(text))
 
 
-def parse_source(dir: Path):
-    result = set()
+def parse_source(dir: Path) -> set[str]:
+    result: set[str] = set()
     for file in dir.iterdir():
-        if file.is_dir() and not file.name in excluded_dirs:
+        if file.is_dir() and file.name not in excluded_dirs:
             result |= parse_source(file)
         elif file.suffix == ".py":
             result |= extract_source_strings(file)
@@ -37,13 +37,12 @@ def update_template():
 
 def update_all():
     strings = parse_source(source_dir)
-    base = {s: None for s in sorted(strings)}
     for lang_file in (source_dir / "language").iterdir():
         if lang_file.name != "en.json" and lang_file.suffix == ".json":
             existing = json.loads(lang_file.read_text(encoding="utf-8"))
-            translations = base.copy()
-            translations.update(existing["translations"])
-            existing["translations"] = translations
+            updated = {s: t for s, t in existing["translations"].items() if s in strings}
+            updated.update({s: None for s in strings if s not in updated})
+            existing["translations"] = updated
             with lang_file.open("w", encoding="utf-8") as f:
                 json.dump(existing, f, ensure_ascii=False, indent=2)
 

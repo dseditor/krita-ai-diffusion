@@ -2,9 +2,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from asyncio import Future
 from datetime import datetime
 from pathlib import Path
-from typing import NamedTuple, Callable
+from typing import NamedTuple
 from PyQt5.QtCore import QByteArray, QUrl, QFile, QBuffer
 from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QSslError
 
@@ -34,26 +35,31 @@ class NetworkError(Exception):
 
     @staticmethod
     def from_reply(reply: QNetworkReply):
-        code = reply.error()  # type: ignore (bug in PyQt5-stubs)
+        code: QNetworkReply.NetworkError = reply.error()  # type: ignore (bug in PyQt5-stubs)
         url = reply.url().toString()
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        try:  # extract detailed information from the payload
-            data = json.loads(reply.readAll().data())
-            error = data.get("error", "Network error")
-            return NetworkError(code, f"{error} ({reply.errorString()})", url, status, data)
-        except:
-            pass
+        if reply.isReadable():
+            try:  # extract detailed information from the payload
+                data = json.loads(reply.readAll().data())
+                error = data.get("error", "Network error")
+                return NetworkError(code, f"{error} ({reply.errorString()})", url, status, data)
+            except Exception:
+                try:
+                    text = reply.readAll().data().decode("utf-8")
+                    if text:
+                        return NetworkError(code, f"{text} ({reply.errorString()})", url, status)
+                except Exception:
+                    pass
+        if code == QNetworkReply.NetworkError.OperationCanceledError:
+            return NetworkError(
+                code, "Connection timed out, the server took too long to respond", url
+            )
         return NetworkError(code, reply.errorString(), url, status)
 
 
 class OutOfMemoryError(NetworkError):
     def __init__(self, code, msg, url):
         super().__init__(code, msg, url)
-
-
-class Interrupted(Exception):
-    def __init__(self):
-        super().__init__(self, "Operation cancelled")
 
 
 class Disconnected(Exception):
@@ -67,22 +73,38 @@ class Request(NamedTuple):
     buffer: QBuffer | None = None
 
 
+Headers = list[tuple[str, str]]
+
+
 class RequestManager:
     def __init__(self):
         self._net = QNetworkAccessManager()
         self._net.finished.connect(self._finished)
         self._net.sslErrors.connect(self._handle_ssl_errors)
         self._requests: dict[QNetworkReply, Request] = {}
+        self._upload_future: Future[tuple[int, int]] | None = None
 
-    def http(self, method, url: str, data: dict | QByteArray | None = None, bearer=""):
+    def http(
+        self,
+        method,
+        url: str,
+        data: dict | QByteArray | None = None,
+        bearer="",
+        headers: Headers | None = None,
+        timeout: float | None = None,
+    ):
         self._cleanup()
 
         request = QNetworkRequest(QUrl(url))
-        # request.setTransferTimeout({"GET": 30000, "POST": 0}[method]) # requires Qt 5.15 (Krita 5.2)
         request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)
         request.setRawHeader(b"ngrok-skip-browser-warning", b"69420")
         if bearer:
             request.setRawHeader(b"Authorization", f"Bearer {bearer}".encode("utf-8"))
+        if headers:
+            for key, value in headers:
+                request.setRawHeader(key.encode("utf-8"), value.encode("utf-8"))
+        if timeout is not None:
+            request.setTransferTimeout(int(timeout * 1000))
 
         assert method in ["GET", "POST", "PUT"]
         if method == "POST":
@@ -108,14 +130,45 @@ class RequestManager:
         self._requests[reply] = Request(url, future)
         return future
 
-    def get(self, url: str, bearer=""):
-        return self.http("GET", url, bearer=bearer)
+    def get(self, url: str, bearer="", timeout: float | None = None):
+        return self.http("GET", url, bearer=bearer, timeout=timeout)
 
     def post(self, url: str, data: dict, bearer=""):
         return self.http("POST", url, data, bearer=bearer)
 
     def put(self, url: str, data: QByteArray | bytes):
         return self.http("PUT", url, data)
+
+    async def upload(self, url: str, data: QByteArray | bytes, sha256: str | None = None):
+        self._cleanup()
+        if isinstance(data, bytes):
+            data = QByteArray(data)
+        assert isinstance(data, QByteArray)
+
+        request = QNetworkRequest(QUrl(url))
+        request.setAttribute(QNetworkRequest.Attribute.FollowRedirectsAttribute, True)
+        if sha256:
+            request.setRawHeader(b"x-amz-checksum-sha256", sha256.encode("utf-8"))
+        request.setHeader(
+            QNetworkRequest.KnownHeaders.ContentTypeHeader, "application/octet-stream"
+        )
+        request.setHeader(QNetworkRequest.KnownHeaders.ContentLengthHeader, data.size())
+        reply = self._net.put(request, data)
+        assert reply is not None, f"Network request for {url} failed: reply is None"
+
+        reply.uploadProgress.connect(self._upload_progress)
+        self._upload_future = asyncio.get_running_loop().create_future()
+        finished_future = asyncio.get_running_loop().create_future()
+        self._requests[reply] = Request(url, finished_future)
+        while self._upload_future is not None:
+            fut = next(asyncio.as_completed([self._upload_future, finished_future]))
+            progress = await fut
+            if isinstance(progress, tuple) and progress[0] != progress[1]:
+                self._upload_future = asyncio.get_running_loop().create_future()
+                yield progress
+            else:
+                yield (len(data), len(data))
+                break
 
     def download(self, url: str):
         self._cleanup()
@@ -135,6 +188,15 @@ class RequestManager:
         reply.downloadProgress.connect(write)
         self._requests[reply] = tracker
         return future
+
+    def _upload_progress(self, bytes_sent: int, bytes_total: int):
+        if bytes_total == 0:
+            return
+        if self._upload_future is None or self._upload_future.done():
+            return
+        if not self._upload_future.cancelled():
+            self._upload_future.set_result((bytes_sent, bytes_total))
+        self._upload_future = None
 
     def _finished(self, reply: QNetworkReply):
         future = None
@@ -213,7 +275,9 @@ class DownloadHelper:
 async def _try_download(network: QNetworkAccessManager, url: str, path: Path):
     out_file = QFile(str(path) + ".part")
     if not out_file.open(QFile.ReadWrite | QFile.Append):  # type: ignore
-        raise Exception(_("Error during download: could not open {path} for writing", path=path))
+        raise Exception(
+            _("Error during download: could not open {path} for writing", path=out_file.fileName())
+        )
 
     request = QNetworkRequest(QUrl(_map_host(url)))
     request.setAttribute(QNetworkRequest.FollowRedirectsAttribute, True)

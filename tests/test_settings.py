@@ -4,7 +4,7 @@ from pathlib import Path
 
 from ai_diffusion.settings import PerformancePreset, Settings, Setting, ServerMode
 from ai_diffusion.style import Style, Styles, StyleSettings, SamplerPreset, SamplerPresets
-from ai_diffusion import style
+from ai_diffusion.style import legacy_map as style_legacy_map
 
 
 def test_get_set():
@@ -52,13 +52,11 @@ def test_performance_preset():
 
 
 def style_is_default(style):
-    return all(
-        [
-            getattr(style, name) == s.default
-            for name, s in StyleSettings.__dict__.items()
-            if isinstance(s, Setting) and name != "name"
-        ]
-    )
+    return all([
+        getattr(style, name) == s.default
+        for name, s in StyleSettings.__dict__.items()
+        if isinstance(s, Setting) and name != "name"
+    ])
 
 
 def test_styles(tmp_path_factory):
@@ -130,10 +128,37 @@ def test_bad_style_type():
         )
 
 
+def test_preferred_style():
+    checkpoints = ["cats", "birds", "snakes"]
+    style = Style(Path("test_style.json"))
+    assert style.preferred_checkpoint(checkpoints) == "not-found"
+    style.checkpoints = ["birds"]
+    assert style.preferred_checkpoint(checkpoints) == "birds"
+    style.checkpoints = ["dogs", "cats"]
+    assert style.preferred_checkpoint(checkpoints) == "cats"
+
+
 def test_default_style(tmp_path_factory):
     styles = Styles(tmp_path_factory.mktemp("builtin"), tmp_path_factory.mktemp("user"))
     style = styles.default
     assert style_is_default(style)
+
+
+def test_duplicate_style(tmp_path_factory):
+    styles = Styles(tmp_path_factory.mktemp("builtin"), tmp_path_factory.mktemp("user"))
+    original = styles.create("original.json")
+    original.loras.append({"name": "lora", "strength": 1.0})
+    original.name = "Original"
+    original.live_sampler_steps = 42
+
+    copy = styles.create(original.filename, copy_from=original)
+    assert copy.filename == "original-1.json"
+    assert copy.name == "Original (Copy)"
+    assert copy.loras == original.loras
+    assert copy.live_sampler_steps == original.live_sampler_steps
+
+    copy.loras[0] = {"name": "lora2", "strength": 2.0}
+    assert copy.loras != original.loras
 
 
 def test_sampler_presets(tmp_path_factory):
@@ -141,20 +166,16 @@ def test_sampler_presets(tmp_path_factory):
 
     builtin_file = dir / "builtin.json"
     builtin_file.write_text(
-        json.dumps(
-            {
-                "Builtin": {"sampler": "dpmpp_2m", "scheduler": "normal", "steps": 42, "cfg": 7.0},
-            }
-        )
+        json.dumps({
+            "Builtin": {"sampler": "dpmpp_2m", "scheduler": "normal", "steps": 42, "cfg": 7.0},
+        })
     )
 
     user_file = dir / "user.json"
     user_file.write_text(
-        json.dumps(
-            {
-                "User": {"sampler": "user_sampler", "scheduler": "normal", "steps": 13, "cfg": 1.0},
-            }
-        )
+        json.dumps({
+            "User": {"sampler": "user_sampler", "scheduler": "normal", "steps": 13, "cfg": 1.0},
+        })
     )
 
     presets = SamplerPresets(builtin_file, user_file)
@@ -173,5 +194,5 @@ def test_sampler_presets(tmp_path_factory):
 
 def test_sampler_preset_conversion():
     presets = SamplerPresets()
-    for old, new in style.legacy_map.items():
+    for old, new in style_legacy_map.items():
         assert presets[old] == presets[new]

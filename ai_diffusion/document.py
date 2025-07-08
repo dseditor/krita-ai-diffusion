@@ -5,12 +5,12 @@ from weakref import WeakValueDictionary
 import krita
 from krita import Krita
 from PyQt5.QtCore import QObject, QUuid, QByteArray, QTimer, pyqtSignal
-from PyQt5.QtGui import QImage
 
 from .image import Extent, Bounds, Mask, Image
 from .layer import Layer, LayerManager, LayerType
 from .pose import Pose
 from .localization import translate as _
+from .util import acquire_elements
 
 
 class Document(QObject):
@@ -120,7 +120,10 @@ class KritaDocument(Document):
     @classmethod
     def active(cls):
         if doc := Krita.instance().activeDocument():
-            if doc not in Krita.instance().documents() or doc.activeNode() is None:
+            if (
+                doc not in acquire_elements(Krita.instance().documents())
+                or doc.activeNode() is None
+            ):
                 return None
             id = doc.rootNode().uniqueId().toString()
             return cls._instances.get(id) or KritaDocument(doc)
@@ -187,13 +190,13 @@ class KritaDocument(Document):
             self._doc.refreshProjection()
 
         bounds = bounds or Bounds(0, 0, self._doc.width(), self._doc.height())
-        img = QImage(self._doc.pixelData(*bounds), *bounds.extent, QImage.Format.Format_ARGB32)
+        img = Image.from_packed_bytes(self._doc.pixelData(*bounds), bounds.extent)
 
         for layer in excluded:
             layer.show()
         if len(excluded) > 0:
             self._doc.refreshProjection()
-        return Image(img)
+        return img
 
     def resize(self, extent: Extent):
         res = self._doc.resolution()
@@ -237,7 +240,7 @@ class KritaDocument(Document):
 
     @property
     def is_valid(self):
-        return self._doc in Krita.instance().documents()
+        return self._doc in acquire_elements(Krita.instance().documents())
 
     @property
     def is_active(self):
@@ -303,14 +306,14 @@ class PoseLayers:
 
         layer = cast(krita.VectorLayer, layer.node)
         pose = self._layers.setdefault(layer.uniqueId(), Pose(doc.extent))
-        self._update(layer, layer.shapes(), pose, doc.resolution)
+        self._update(layer, acquire_elements(layer.shapes()), pose, doc.resolution)
 
     def add_character(self, layer: krita.VectorLayer):
         doc = KritaDocument.active()
         assert doc is not None
         pose = self._layers.setdefault(layer.uniqueId(), Pose(doc.extent))
         svg = Pose.create_default(doc.extent, pose.people_count).to_svg()
-        shapes = layer.addShapesFromSvg(svg)
+        shapes = acquire_elements(layer.addShapesFromSvg(svg))
         self._update(layer, shapes, pose, doc.resolution)
 
     def _update(

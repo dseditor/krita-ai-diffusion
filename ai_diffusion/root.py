@@ -1,13 +1,18 @@
 from __future__ import annotations
-from typing import Callable, NamedTuple
+from dataclasses import dataclass
+from typing import Callable
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .connection import Connection, ConnectionState
 from .client import ClientMessage
+from .custom_workflow import WorkflowCollection
 from .server import Server, ServerState
 from .document import Document, KritaDocument
 from .model import Model
+from .files import FileFormat, FileLibrary, File, FileSource
 from .persistence import ModelSync, RecentlyUsedSync, import_prompt_from_file
+from .updates import AutoUpdate
+from .ui.theme import checkpoint_icon
 from .settings import ServerMode, settings
 from .util import client_logger as log
 
@@ -16,9 +21,10 @@ class Root(QObject):
     """Root object, exists once, maintains all other instances. Keeps track of documents
     openend in Krita and creates a corresponding Model for each."""
 
-    class PerDocument(NamedTuple):
+    @dataclass
+    class PerDocument:
         model: Model
-        sync: ModelSync
+        sync: ModelSync | None = None
 
     _server: Server
     _connection: Connection
@@ -33,20 +39,28 @@ class Root(QObject):
     def init(self):
         self._server = Server(settings.server_path)
         self._connection = Connection()
+        self._files = FileLibrary.load()
+        self._workflows = WorkflowCollection(self._connection)
         self._models = []
+        self._null_model = Model(Document(), self._connection, self._workflows)
         self._recent = RecentlyUsedSync.from_settings()
+        self._auto_update = AutoUpdate()
+        if settings.auto_update:
+            self._auto_update.check()
         self._connection.message_received.connect(self._handle_message)
+        self._connection.models_changed.connect(self._update_files)
 
     def prune_models(self):
         # Remove models for documents that have been closed
         self._models = [m for m in self._models if m.model.document.is_valid]
 
     def create_model(self, doc: KritaDocument):
-        model = Model(doc, self._connection)
+        model = Model(doc, self._connection, self._workflows)
+        model_entry = Root.PerDocument(model)
+        self._models.append(model_entry)
         self._recent.track(model)
-        persistence_sync = ModelSync(model)
+        model_entry.sync = ModelSync(model)
         import_prompt_from_file(model)
-        self._models.append(Root.PerDocument(model, persistence_sync))
         self.model_created.emit(model)
         self.prune_models()
         return model
@@ -71,10 +85,22 @@ class Root(QObject):
         return self._server
 
     @property
+    def files(self) -> FileLibrary:
+        return self._files
+
+    @property
+    def workflows(self) -> WorkflowCollection:
+        return self._workflows
+
+    @property
+    def auto_update(self) -> AutoUpdate:
+        return self._auto_update
+
+    @property
     def active_model(self):
         if model := self.model_for_active_document():
             return model
-        return Model(Document(), self._connection)
+        return self._null_model
 
     async def autostart(self, signal_server_change: Callable):
         connection = self._connection
@@ -93,11 +119,21 @@ class Root(QObject):
                     settings.server_url, ServerMode.cloud, settings.access_token
                 )
             elif settings.server_mode in [ServerMode.undefined, ServerMode.external]:
-                await connection._connect(settings.server_url, ServerMode.external)
+                urls = [settings.server_url]
+                if settings.server_mode is ServerMode.undefined:
+                    urls.append("127.0.0.1:8000")  # ComfyUI Desktop default port
+                for url in urls:
+                    await connection._connect(url, ServerMode.external)
+                    if connection.state is ConnectionState.connected:
+                        settings.server_url = url
+                        break
                 if settings.server_mode is ServerMode.undefined:
                     if connection.state is ConnectionState.connected:
                         settings.server_mode = ServerMode.external
+                        settings.save()
                     else:
+                        connection.state = ConnectionState.disconnected
+                        connection.error = ""
                         settings.server_mode = ServerMode.cloud
         except Exception as e:
             log.warning(f"Failed to launch/connect server at startup: {e}")
@@ -117,6 +153,23 @@ class Root(QObject):
         model = self._find_model(msg.job_id)
         if model is not None:
             model.handle_message(msg)
+
+    def _update_files(self):
+        if client := self._connection.client_if_connected:
+            checkpoints = [
+                File(
+                    cp.filename,
+                    cp.name,
+                    FileSource.remote,
+                    cp.format,
+                    icon=checkpoint_icon(cp.arch, cp.format, client),
+                )
+                for cp in client.models.checkpoints.values()
+            ]
+            self._files.checkpoints.update(checkpoints, FileSource.remote)
+
+            loras = [File.remote(lora, FileFormat.lora) for lora in client.models.loras]
+            self._files.loras.update(loras, FileSource.remote)
 
 
 root = Root()

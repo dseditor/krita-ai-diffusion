@@ -5,8 +5,8 @@ import krita
 from PyQt5.QtCore import QObject, QUuid, QByteArray, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage
 
-from .image import Extent, Bounds, Image
-from .util import ensure, maybe, client_logger as log
+from .image import Extent, Bounds, Image, ImageCollection
+from .util import acquire_elements, ensure, maybe, client_logger as log
 from . import eventloop
 
 
@@ -56,12 +56,6 @@ class Layer(QObject):
     from/to QImage. Exposes some events based on polling done in LayerManager.
     Layer objects are cached, there is a guarantee only one instance exists per layer node.
     """
-
-    _manager: LayerManager
-    _node: krita.Node
-    _name: str
-    _parent: QUuid | None
-    _is_confirmed: bool
 
     def __init__(self, manager: LayerManager, node: krita.Node, is_confirmed=True):
         super().__init__()
@@ -143,7 +137,11 @@ class Layer(QObject):
 
     @property
     def child_layers(self):
-        return [self._manager.wrap(child) for child in self._node.childNodes() if _is_real(child)]
+        return [
+            self._manager.wrap(child)
+            for child in acquire_elements(self._node.childNodes())
+            if _is_real(child)
+        ]
 
     @property
     def is_root(self):
@@ -151,12 +149,13 @@ class Layer(QObject):
 
     def get_pixels(self, bounds: Bounds | None = None, time: int | None = None):
         bounds = bounds or self.bounds
+        assert self._node.colorDepth() == "U8", "Operation only supports 8-bit images"
         if time is None:
             data: QByteArray = self._node.projectionPixelData(*bounds)
         else:
             data: QByteArray = self._node.pixelDataAtTime(*bounds, time)
         assert data is not None and data.size() >= bounds.extent.pixel_count * 4
-        return Image(QImage(data, *bounds.extent, QImage.Format.Format_ARGB32))
+        return Image.from_packed_bytes(data, bounds.extent)
 
     def write_pixels(
         self,
@@ -190,16 +189,30 @@ class Layer(QObject):
             else:
                 data: QByteArray = self._node.pixelDataAtTime(*bounds, time)
             assert data is not None and data.size() >= bounds.extent.pixel_count
-            return Image(QImage(data, *bounds.extent, QImage.Format.Format_Grayscale8))
+            return Image.from_packed_bytes(data, bounds.extent, channels=1)
         else:
             img = self.get_pixels(bounds, time)
             alpha = img._qimage.convertToFormat(QImage.Format.Format_Alpha8)
             alpha.reinterpretAsFormat(QImage.Format.Format_Grayscale8)
             return Image(alpha)
 
+    def _get_frames(self, fn, bounds: Bounds | None = None):
+        doc = ensure(self._manager._doc)
+        bounds = bounds or self.bounds
+        time_range = range(doc.playBackStartTime(), doc.playBackEndTime() + 1)
+        return ImageCollection(
+            (fn(bounds, time) for time in time_range if self._node.hasKeyframeAtTime(time))
+        )
+
+    def get_pixel_frames(self, bounds: Bounds | None = None):
+        return self._get_frames(self.get_pixels, bounds)
+
+    def get_mask_frames(self, bounds: Bounds | None = None):
+        return self._get_frames(self.get_mask, bounds)
+
     def move_to_top(self):
         parent = self._node.parentNode()
-        if parent.childNodes()[-1] == self._node:
+        if acquire_elements(parent.childNodes())[-1] == self._node:
             return  # already top-most layer
         with RestoreActiveLayer(self._manager):
             parent.removeChildNode(self.node)
@@ -382,10 +395,6 @@ class LayerManager(QObject):
             return
 
         with self._update_guard():
-            if active.uniqueId() != self._active_id:
-                self._active_id = active.uniqueId()
-                self.active_changed.emit()
-
             removals = set(self._layers.keys())
             changes = False
             for n in traverse_layers(root_node):
@@ -403,6 +412,11 @@ class LayerManager(QObject):
                 if self._layers[id].is_confirmed:
                     self.removed.emit(self._layers[id])
                     del self._layers[id]
+
+            active_id = active.uniqueId()
+            if active_id != self._active_id and active_id in self._layers:
+                self._active_id = active_id
+                self.active_changed.emit()
 
             if removals or changes:
                 self.changed.emit()
@@ -528,19 +542,19 @@ class LayerManager(QObject):
     _mask_types = [t.value for t in LayerType if t.is_mask]
 
     @property
-    def all(self):
+    def all(self) -> list[Layer]:
         if self._doc is None:
             return []
         return [self.wrap(n) for n in traverse_layers(self._doc.rootNode())]
 
     @property
-    def images(self):
+    def images(self) -> list[Layer]:
         if self._doc is None:
             return []
         return [self.wrap(n) for n in traverse_layers(self._doc.rootNode(), self._image_types)]
 
     @property
-    def masks(self):
+    def masks(self) -> list[Layer]:
         if self._doc is None:
             return []
         return [self.wrap(n) for n in traverse_layers(self._doc.rootNode(), self._mask_types)]
@@ -556,7 +570,7 @@ class LayerManager(QObject):
 
 
 def traverse_layers(node: krita.Node, type_filter: list[str] | None = None):
-    for child in node.childNodes():
+    for child in acquire_elements(node.childNodes()):
         type = child.type()
         if _is_real(type) and (not type_filter or type in type_filter):
             yield child

@@ -19,8 +19,21 @@ from ..root import root
 from .control import ControlListWidget
 from .region import ActiveRegionWidget, PromptHeader
 from .widget import WorkspaceSelectWidget, StyleSelectWidget, StrengthWidget
-from .widget import create_wide_tool_button
+from .widget import ErrorBox, create_wide_tool_button
 from . import theme
+
+
+class LivePreviewArea(QLabel):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAlignment(Qt.AlignmentFlag(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft))
+
+    def show_image(self, image: Image):
+        target = Extent.from_qsize(self.size())
+        img = Image.scale_to_fit(image, target)
+        self.setPixmap(img.to_pixmap())
+        self.setMinimumSize(256, 256)
 
 
 class LiveWidget(QWidget):
@@ -119,14 +132,17 @@ class LiveWidget(QWidget):
         )
         self.add_region_button = create_wide_tool_button("region-add", _("Add Region"), self)
         prompt_buttons_layout = QVBoxLayout()
+        prompt_buttons_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         prompt_buttons_layout.setSpacing(2)
         prompt_buttons_layout.addWidget(self.add_region_button)
         prompt_buttons_layout.addWidget(self.add_control_button)
 
         self.region_widget = ActiveRegionWidget(self._model.regions, self, header=PromptHeader.icon)
+        self.region_widget.is_slim = True
         self.region_widget.focused.connect(self.focus_active_region)
 
         self.prompt_widget = ActiveRegionWidget(self._model.regions, self, header=PromptHeader.icon)
+        self.prompt_widget.is_slim = True
         self.prompt_widget.focused.connect(self.focus_root_region)
 
         prompt_text_layout = QVBoxLayout()
@@ -140,11 +156,8 @@ class LiveWidget(QWidget):
         layout.addLayout(cond_layout)
         layout.addWidget(self.control_list)
 
-        self.error_text = QLabel(self)
-        self.error_text.setStyleSheet("font-weight: bold; color: red;")
-        self.error_text.setWordWrap(True)
-        self.error_text.setVisible(False)
-        layout.addWidget(self.error_text)
+        self.error_box = ErrorBox(self)
+        layout.addWidget(self.error_box)
 
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setTextVisible(True)
@@ -163,11 +176,7 @@ class LiveWidget(QWidget):
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
-        self.preview_area = QLabel(self)
-        self.preview_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.preview_area.setAlignment(
-            Qt.AlignmentFlag(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        )
+        self.preview_area = LivePreviewArea(self)
         layout.addWidget(self.preview_area)
 
     @property
@@ -184,6 +193,7 @@ class LiveWidget(QWidget):
                 bind(model, "style", self.style_select, "value"),
                 bind(model.live, "strength", self.strength_slider, "value"),
                 bind(model, "seed", self.seed_input, "value"),
+                bind(model, "error", self.error_box, "error", Bind.one_way),
                 model.live.is_active_changed.connect(self.update_is_active),
                 model.live.is_recording_changed.connect(self.update_is_recording),
                 model.live.has_result_changed.connect(self.apply_button.setEnabled),
@@ -191,8 +201,6 @@ class LiveWidget(QWidget):
                 self.add_region_button.clicked.connect(model.regions.create_region_layer),
                 self.add_control_button.clicked.connect(model.regions.add_control),
                 self.random_seed_button.clicked.connect(model.generate_seed),
-                model.error_changed.connect(self.error_text.setText),
-                model.has_error_changed.connect(self.error_text.setVisible),
                 model.progress_changed.connect(self.update_progress),
                 model.live.result_available.connect(self.show_result),
                 model.regions.active_changed.connect(self.update_region),
@@ -221,12 +229,9 @@ class LiveWidget(QWidget):
 
     def update_region(self):
         has_regions = len(self.model.regions) > 0
-        max_lines = 1 if has_regions else 2
         self.region_widget.setVisible(has_regions)
         self.region_widget.region = self.model.regions.region_for_active_layer
         self.prompt_widget.header_style = PromptHeader.icon if has_regions else PromptHeader.none
-        self.region_widget.max_lines = max_lines
-        self.prompt_widget.max_lines = max_lines
         self.control_list.model = self.model.regions.active_or_root.control
 
     def focus_root_region(self):
@@ -252,10 +257,7 @@ class LiveWidget(QWidget):
 
     def show_result(self, image: Image):
         self.progress_bar.setVisible(False)
-        target = Extent.from_qsize(self.preview_area.size())
-        img = Image.scale_to_fit(image, target)
-        self.preview_area.setPixmap(img.to_pixmap())
-        self.preview_area.setMinimumSize(256, 256)
+        self.preview_area.show_image(image)
 
     def apply_result(self):
         self.model.live.apply_result()

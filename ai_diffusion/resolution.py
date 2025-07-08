@@ -4,8 +4,8 @@ from enum import Enum
 from typing import NamedTuple, overload
 
 from .api import ExtentInput, ImageInput
-from .image import Bounds, Extent, Image, Mask, Point, multiple_of
-from .resources import SDVersion
+from .image import Bounds, Extent, Image, Point, multiple_of
+from .resources import Arch
 from .settings import PerformanceSettings
 from .style import Style
 
@@ -105,7 +105,7 @@ class ScaledExtent(NamedTuple):
     @property
     def initial_scaling(self):
         ratio = Extent.ratio(self.input, self.initial)
-        if ratio < 1:
+        if ratio != 1:
             return ScaleMode.resize
         else:
             return ScaleMode.none
@@ -142,14 +142,16 @@ class CheckpointResolution(NamedTuple):
     max_scale: float
 
     @staticmethod
-    def compute(extent: Extent, sd_ver: SDVersion, style: Style | None = None):
+    def compute(extent: Extent, arch: Arch, style: Style | None = None):
+        arch = Arch.sdxl if arch.is_sdxl_like else arch
+        arch = Arch.flux if arch.is_flux_like else arch
         if style is None or style.preferred_resolution == 0:
             min_size, max_size, min_pixel_count, max_pixel_count = {
-                SDVersion.sd15: (512, 768, 512**2, 512 * 768),
-                SDVersion.sdxl: (896, 1280, 1024**2, 1024**2),
-                SDVersion.sd3: (512, 1536, 512**2, 1536**2),
-                SDVersion.flux: (256, 2048, 512**2, 2048**2),
-            }[sd_ver]
+                Arch.sd15: (512, 768, 512**2, 512 * 768),
+                Arch.sdxl: (640, 1280, 800**2, 1024**2),
+                Arch.sd3: (512, 1536, 512**2, 1536**2),
+                Arch.flux: (256, 2048, 512**2, 2048**2),
+            }[arch]
         else:
             range_offset = multiple_of(round(0.2 * style.preferred_resolution), 8)
             min_size = style.preferred_resolution - range_offset
@@ -171,7 +173,7 @@ def apply_resolution_settings(extent: Extent, settings: PerformanceSettings):
 def prepare_diffusion_input(
     extent: Extent,
     image: Image | None,
-    sd_version: SDVersion,
+    arch: Arch,
     style: Style,
     perf: PerformanceSettings,
     downscale=True,
@@ -181,13 +183,11 @@ def prepare_diffusion_input(
 
     # The checkpoint may require a different resolution than what is requested.
     mult = 8
-    if sd_version is SDVersion.flux:
+    if arch.is_flux_like:
         mult = 16
-    if SDVersion is SDVersion.sd3:
+    if arch is Arch.sd3:
         mult = 64
-    min_size, max_size, min_scale, max_scale = CheckpointResolution.compute(
-        desired, sd_version, style
-    )
+    min_size, max_size, min_scale, max_scale = CheckpointResolution.compute(desired, arch, style)
 
     if downscale and max_scale < 1 and any(x > max_size for x in desired):
         # Desired resolution is larger than the maximum size. Do 2 passes:
@@ -211,24 +211,25 @@ def prepare_diffusion_input(
     else:  # Desired resolution is in acceptable range. Do 1 pass at desired resolution.
         input = extent
         initial = desired = desired.multiple_of(mult)
-        # Scale down input images if needed due to resolution_multiplier or max_pixel_count
-        if extent.pixel_count > desired.pixel_count:
-            input = desired
-            image = Image.scale(image, desired) if image else None
+
+    # Scale down input images if needed due to resolution_multiplier or max_pixel_count
+    if extent.pixel_count > desired.pixel_count:
+        input = desired
+        image = Image.scale(image, desired) if image else None
 
     batch = compute_batch_size(Extent.largest(initial, desired), 512, perf.batch_size)
     return ScaledExtent(input, initial, desired, extent), image, batch
 
 
 def prepare_extent(
-    extent: Extent, sd_ver: SDVersion, style: Style, perf: PerformanceSettings, downscale=True
+    extent: Extent, sd_ver: Arch, style: Style, perf: PerformanceSettings, downscale=True
 ):
     scaled, _, batch = prepare_diffusion_input(extent, None, sd_ver, style, perf, downscale)
     return ImageInput(scaled.as_input), batch
 
 
 def prepare_image(
-    image: Image, sd_ver: SDVersion, style: Style, perf: PerformanceSettings, downscale=True
+    image: Image, sd_ver: Arch, style: Style, perf: PerformanceSettings, downscale=True
 ):
     scaled, out_image, batch = prepare_diffusion_input(
         image.extent, image, sd_ver, style, perf, downscale
@@ -278,7 +279,7 @@ class TileLayout:
         self.image_extent = extent
         self.min_size = min_tile_size
         self.padding = padding
-        self.blending = max(1, self.padding // 16) * 8
+        self.blending = max(1, self.padding // 16) * 8 if padding > 0 else 0
         self.tile_count = (self.image_extent // (min_tile_size - 2 * self.padding)).at_least(1)
 
         padded = extent + (self.tile_count - Extent(1, 1)) * 2 * self.padding

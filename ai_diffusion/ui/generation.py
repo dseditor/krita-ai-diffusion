@@ -1,36 +1,26 @@
 from __future__ import annotations
-from PyQt5.QtCore import Qt, QMetaObject, QSize, QPoint, QUuid, pyqtSignal
-from PyQt5.QtGui import QGuiApplication, QMouseEvent
-from PyQt5.QtWidgets import (
-    QAction,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QProgressBar,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QListView,
-    QSizePolicy,
-    QToolButton,
-    QComboBox,
-    QCheckBox,
-    QMenu,
-    QShortcut,
-    QMessageBox,
-)
+from textwrap import wrap as wrap_text
+from typing import cast
+from PyQt5.QtCore import Qt, QEvent, QMetaObject, QSize, QPoint, QTimer, QUuid, pyqtSignal
+from PyQt5.QtCore import QItemSelectionModel
+from PyQt5.QtGui import QGuiApplication, QMouseEvent, QKeyEvent, QKeySequence
+from PyQt5.QtGui import QPalette, QColor, QIcon
+from PyQt5.QtWidgets import QAction, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QProgressBar
+from PyQt5.QtWidgets import QListWidget, QListWidgetItem, QListView, QSizePolicy
+from PyQt5.QtWidgets import QComboBox, QCheckBox, QMenu, QMessageBox, QToolButton
 
 from ..properties import Binding, Bind, bind, bind_combo, bind_toggle
 from ..image import Bounds, Extent, Image
 from ..jobs import Job, JobQueue, JobState, JobKind, JobParams
-from ..model import Model, InpaintContext, RootRegion
+from ..model import Model, InpaintContext, RootRegion, ProgressKind, Workspace
+from ..style import Styles
 from ..root import root
 from ..workflow import InpaintMode, FillMode
 from ..localization import translate as _
-from ..util import ensure
+from ..resources import Arch
+from ..util import ensure, flatten, sequence_equal
 from .widget import WorkspaceSelectWidget, StyleSelectWidget, StrengthWidget, QueueButton
-from .widget import GenerateButton, create_wide_tool_button
+from .widget import GenerateButton, ErrorBox, create_wide_tool_button
 from .region import RegionPromptWidget
 from . import theme
 
@@ -59,7 +49,7 @@ class HistoryWidget(QListWidget):
         }}
     """
 
-    def __init__(self, parent):
+    def __init__(self, parent: QWidget | None):
         super().__init__(parent)
         self._model = root.active_model
         self._connections = []
@@ -76,6 +66,7 @@ class HistoryWidget(QListWidget):
         self.setDragEnabled(False)
         self.itemClicked.connect(self.handle_preview_click)
         self.itemDoubleClicked.connect(self.item_activated)
+        self.itemSelectionChanged.connect(self.select_item)
 
         self._apply_button = QPushButton(theme.icon("apply"), _("Apply"), self)
         self._apply_button.setStyleSheet(self._button_css)
@@ -96,12 +87,6 @@ class HistoryWidget(QListWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
 
-        widget_context = Qt.ShortcutContext.WidgetShortcut
-        QShortcut(Qt.Key.Key_Delete, self, self._discard_image, self._discard_image, widget_context)
-        QShortcut(
-            Qt.Key.Key_Space, self, self._toggle_selection, self._toggle_selection, widget_context
-        )
-
     @property
     def model_(self):
         return self._model
@@ -113,7 +98,6 @@ class HistoryWidget(QListWidget):
         jobs = model.jobs
         self._connections = [
             jobs.selection_changed.connect(self.update_selection),
-            self.itemSelectionChanged.connect(self.select_item),
             jobs.job_finished.connect(self.add),
             jobs.job_discarded.connect(self.remove),
             jobs.result_used.connect(self.update_image_thumbnail),
@@ -123,18 +107,17 @@ class HistoryWidget(QListWidget):
         self.update_selection()
 
     def add(self, job: Job):
-        if job.state is not JobState.finished or job.kind is not JobKind.diffusion:
-            return  # Only finished diffusion jobs have images to show
+        if not self.is_finished(job):
+            return  # Only finished diffusion/animation jobs have images to show
 
         scrollbar = self.verticalScrollBar()
-        scroll_to_bottom = (
-            scrollbar and scrollbar.isVisible() and scrollbar.value() >= scrollbar.maximum() - 4
-        )
-        prompt = job.params.prompt if job.params.prompt != "" else "<no prompt>"
+        scroll_to_bottom = scrollbar and scrollbar.value() >= scrollbar.maximum() - 4
 
         if not JobParams.equal_ignore_seed(self._last_job_params, job.params):
             self._last_job_params = job.params
-            strength = f"{job.params.strength*100:.0f}% - " if job.params.strength != 1.0 else ""
+            prompt = job.params.name if job.params.name != "" else "<no prompt>"
+            strength = job.params.metadata.get("strength", 1.0)
+            strength = f"{strength * 100:.0f}% - " if strength != 1.0 else ""
 
             header = QListWidgetItem(f"{job.timestamp:%H:%M} - {strength}{prompt}")
             header.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -144,19 +127,72 @@ class HistoryWidget(QListWidget):
             header.setTextAlignment(Qt.AlignmentFlag.AlignLeft)
             self.addItem(header)
 
-        for i, img in enumerate(job.results):
-            item = QListWidgetItem(self._image_thumbnail(job, i), None)  # type: ignore (text can be None)
+        if job.kind is JobKind.diffusion:
+            for i, img in enumerate(job.results):
+                item = QListWidgetItem(self._image_thumbnail(job, i), None)  # type: ignore (text can be None)
+                item.setData(Qt.ItemDataRole.UserRole, job.id)
+                item.setData(Qt.ItemDataRole.UserRole + 1, i)
+                item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info(job.params))
+                self.addItem(item)
+
+        if job.kind is JobKind.animation:
+            item = AnimatedListItem([
+                self._image_thumbnail(job, i) for i in range(len(job.results))
+            ])
             item.setData(Qt.ItemDataRole.UserRole, job.id)
-            item.setData(Qt.ItemDataRole.UserRole + 1, i)
-            item.setData(
-                Qt.ItemDataRole.ToolTipRole,
-                f"{prompt} @ {job.params.strength*100:.0f}% strength\n"
-                + _("Click to toggle preview, double-click to apply."),
-            )
+            item.setData(Qt.ItemDataRole.UserRole + 1, 0)
+            item.setData(Qt.ItemDataRole.ToolTipRole, self._job_info(job.params))
             self.addItem(item)
 
         if scroll_to_bottom:
             self.scrollToBottom()
+
+    _job_info_translations = {
+        "prompt": _("Prompt"),
+        "negative_prompt": _("Negative Prompt"),
+        "style": _("Style"),
+        "strength": _("Strength"),
+        "checkpoint": _("Model"),
+        "loras": _("LoRA"),
+        "sampler": _("Sampler"),
+        "seed": _("Seed"),
+    }
+
+    def _job_info(self, params: JobParams, tooltip_header: bool = True):
+        title = params.name if params.name != "" else "<no prompt>"
+        if len(title) > 70:
+            title = title[:66] + "..."
+        if params.strength != 1.0:
+            title = f"{title} @ {params.strength * 100:.0f}%"
+        style = Styles.list().find(params.style)
+        strings: list[str | list[str]] = (
+            [
+                title + "\n",
+                _("Click to toggle preview, double-click to apply."),
+                "",
+            ]
+            if tooltip_header
+            else []
+        )
+        for key, value in params.metadata.items():
+            if key == "style" and style:
+                value = style.name
+            if isinstance(value, list) and len(value) == 0:
+                continue
+            if isinstance(value, list) and isinstance(value[0], dict):
+                value = "\n  ".join(
+                    (
+                        f"{v.get('name')} ({v.get('strength')})"
+                        for v in value
+                        if v.get("enabled", True)
+                    )
+                )
+            s = f"{self._job_info_translations.get(key, key)}: {value}"
+            if tooltip_header:
+                s = wrap_text(s, 80, subsequent_indent=" ")
+            strings.append(s)
+        strings.append(_("Seed") + f": {params.seed}")
+        return "\n".join(flatten(strings))
 
     def remove(self, job: Job):
         self._remove_items(ensure(job.id))
@@ -186,18 +222,36 @@ class HistoryWidget(QListWidget):
                     item = self.item(current)
 
         if item_was_selected:
-            self._model.jobs.selection = None
+            self._model.jobs.selection = []
         else:
             self.update_apply_button()  # selection may have moved
 
+        for i in range(self.count()):
+            item = self.item(i)
+            next_item = self.item(i + 1)
+            if item and item.text() != "" and next_item and next_item.text() != "":
+                self.takeItem(i)
+
     def update_selection(self):
-        selection = self._model.jobs.selection
-        if selection is None:
-            self.clearSelection()
-        elif selection:
-            item = self._find(selection)
-            if item is not None and not item.isSelected():
-                item.setSelected(True)
+        current = [self._item_data(i) for i in self.selectedItems()]
+        changed = not sequence_equal(self._model.jobs.selection, current)
+
+        with theme.SignalBlocker(self):
+            for i in range(self.count()):
+                item = self.item(i)
+                if item and item.type() == QListWidgetItem.ItemType.UserType:
+                    cast(AnimatedListItem, item).stop_animation()
+
+            if changed:  # don't mess with widget's state if it already matches
+                self.clearSelection()
+
+            for selection in self._model.jobs.selection:
+                if item := self._find(selection):
+                    if changed:
+                        item.setSelected(True)
+                    if item.type() == QListWidgetItem.ItemType.UserType:
+                        cast(AnimatedListItem, item).start_animation()
+
         self.update_apply_button()
 
     def update_apply_button(self):
@@ -234,11 +288,7 @@ class HistoryWidget(QListWidget):
             item.setIcon(self._image_thumbnail(job, id.image))
 
     def select_item(self):
-        items = self.selectedItems()
-        if len(items) > 0:
-            self._model.jobs.selection = self._item_data(items[0])
-        else:
-            self._model.jobs.selection = None
+        self._model.jobs.selection = [self._item_data(i) for i in self.selectedItems()]
 
     def _toggle_selection(self):
         self._model.jobs.toggle_selection()
@@ -249,7 +299,7 @@ class HistoryWidget(QListWidget):
             self.item_activated.emit(items[0])
 
     def is_finished(self, job: Job):
-        return job.kind is JobKind.diffusion and job.state is JobState.finished
+        return job.kind in [JobKind.diffusion, JobKind.animation] and job.state is JobState.finished
 
     def rebuild(self):
         self.clear()
@@ -283,12 +333,26 @@ class HistoryWidget(QListWidget):
             item = self.itemAt(e.pos())
             if item is not None and item.isSelected():
                 self.clearSelection()
+                e.accept()
                 return
         super().mousePressEvent(e)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.update_apply_button()
+
+    def event(self, e: QEvent | None):
+        assert e is not None
+        # Disambiguate shortcut events which Krita overrides
+        if e.type() == QEvent.Type.ShortcutOverride:
+            assert isinstance(e, QKeyEvent)
+            if e.matches(QKeySequence.StandardKey.Delete):
+                self._discard_image()
+                e.accept()
+            elif e.key() == Qt.Key.Key_Space:
+                self._toggle_selection()
+                e.accept()
+        return super().event(e)
 
     def _find(self, id: JobQueue.Item):
         items = (ensure(self.item(i)) for i in range(self.count()))
@@ -313,10 +377,15 @@ class HistoryWidget(QListWidget):
     def _show_context_menu(self, pos: QPoint):
         item = self.itemAt(pos)
         if item is not None:
+            job = self._model.jobs.find(self._item_data(item).job)
             menu = QMenu(self)
             menu.addAction(_("Copy Prompt"), self._copy_prompt)
             menu.addAction(_("Copy Strength"), self._copy_strength)
+            style_action = ensure(menu.addAction(_("Copy Style"), self._copy_style))
+            if job is None or Styles.list().find(job.params.style) is None:
+                style_action.setEnabled(False)
             menu.addAction(_("Copy Seed"), self._copy_seed)
+            menu.addAction(_("Info to Clipboard"), self._info_to_clipboard)
             menu.addSeparator()
             save_action = ensure(menu.addAction(_("Save Image"), self._save_image))
             if self._model.document.filename == "":
@@ -342,16 +411,31 @@ class HistoryWidget(QListWidget):
             active = self._model.regions.active_or_root
             active.positive = job.params.prompt
             if isinstance(active, RootRegion):
-                active.negative = job.params.negative_prompt
+                active.negative = job.params.metadata.get("negative_prompt", "")
+
+            if clipboard := QGuiApplication.clipboard():
+                clipboard.setText(job.params.prompt)
+
+            if self._model.workspace is Workspace.custom and self._model.document.is_active:
+                self._model.custom.try_set_params(job.params.metadata)
 
     def _copy_strength(self):
         if job := self.selected_job:
             self._model.strength = job.params.strength
 
+    def _copy_style(self):
+        if job := self.selected_job:
+            if style := Styles.list().find(job.params.style):
+                self._model.style = style
+
     def _copy_seed(self):
         if job := self.selected_job:
             self._model.fixed_seed = True
             self._model.seed = job.params.seed
+
+    def _info_to_clipboard(self):
+        if (job := self.selected_job) and (clipboard := QGuiApplication.clipboard()):
+            clipboard.setText(self._job_info(job.params, tooltip_header=False))
 
     def _save_image(self):
         items = self.selectedItems()
@@ -361,9 +445,12 @@ class HistoryWidget(QListWidget):
 
     def _discard_image(self):
         items = self.selectedItems()
+        next_item = self.row(items[0]) if len(items) > 0 else -1
         for item in items:
             job_id, image_index = self.item_info(item)
             self._model.jobs.discard(job_id, image_index)
+        if next_item >= 0:
+            self.setCurrentRow(next_item, QItemSelectionModel.SelectionFlag.Current)
 
     def _clear_all(self):
         reply = QMessageBox.warning(
@@ -376,6 +463,33 @@ class HistoryWidget(QListWidget):
         if reply == QMessageBox.Yes:
             self._model.jobs.clear()
             self.clear()
+
+
+class AnimatedListItem(QListWidgetItem):
+    def __init__(self, images: list[QIcon]):
+        super().__init__(images[0], None, type=QListWidgetItem.ItemType.UserType)
+        self._images = images
+        self._current = 0
+        self._is_running = False
+        self._timer = QTimer()
+        self._timer.setSingleShot(False)
+        self._timer.timeout.connect(self._next_frame)
+
+    def start_animation(self):
+        if not self._is_running:
+            self._is_running = True
+            self._timer.start(40)
+
+    def stop_animation(self):
+        if self._is_running:
+            self._timer.stop()
+            self._is_running = False
+            self._current = 0
+            self.setIcon(self._images[self._current])
+
+    def _next_frame(self):
+        self._current = (self._current + 1) % len(self._images)
+        self.setIcon(self._images[self._current])
 
 
 class CustomInpaintWidget(QWidget):
@@ -409,8 +523,10 @@ class CustomInpaintWidget(QWidget):
         self.fill_mode_combo.setStyleSheet(theme.flat_combo_stylesheet)
         self.fill_mode_combo.setToolTip(_("Pre-fill the selected region before diffusion"))
 
+        def ctx_icon(name):
+            return theme.icon(f"context-{name}")
+
         self.context_combo = QComboBox(self)
-        ctx_icon = lambda name: theme.icon(f"context-{name}")
         self.context_combo.addItem(
             ctx_icon("automatic"), _("Automatic Context"), InpaintContext.automatic
         )
@@ -451,15 +567,19 @@ class CustomInpaintWidget(QWidget):
                 bind_combo(model.inpaint, "fill", self.fill_mode_combo),
                 bind_toggle(model.inpaint, "use_inpaint", self.use_inpaint_button),
                 bind_toggle(model.inpaint, "use_prompt_focus", self.use_prompt_focus_button),
+                model.style_changed.connect(self.update_widgets_enabled),
+                model.strength_changed.connect(self.update_widgets_enabled),
                 model.layers.changed.connect(self.update_context_layers),
-                model.strength_changed.connect(self.update_fill_enabled),
             ]
-            self.update_fill_enabled()
+            self.update_widgets_enabled()
             self.update_context_layers()
             self.update_context()
 
-    def update_fill_enabled(self):
+    def update_widgets_enabled(self):
+        arch = self._model.arch
         self.fill_mode_combo.setEnabled(self.model.strength == 1.0)
+        self.use_inpaint_button.setEnabled(arch.is_sdxl_like or arch.has_controlnet_inpaint)
+        self.use_prompt_focus_button.setEnabled(arch is Arch.sd15 or arch.is_sdxl_like)
 
     def update_context_layers(self):
         current = self.context_combo.currentData()
@@ -488,6 +608,47 @@ class CustomInpaintWidget(QWidget):
             self._model.inpaint.context_layer_id = data
         elif isinstance(data, InpaintContext):
             self._model.inpaint.context = data
+
+
+class ProgressBar(QProgressBar):
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._model = root.active_model
+        self._model_bindings: list[QMetaObject.Connection] = []
+        self._palette = self.palette()
+        self.setMinimum(0)
+        self.setMaximum(1000)
+        self.setTextVisible(False)
+        self.setFixedHeight(6)
+
+    @property
+    def model(self):
+        return self._model
+
+    @model.setter
+    def model(self, model: Model):
+        if self._model != model:
+            Binding.disconnect_all(self._model_bindings)
+            self._model = model
+            self._model_bindings = [
+                self._model.progress_changed.connect(self._update_progress),
+                self._model.progress_kind_changed.connect(self._update_progress_kind),
+            ]
+
+    def _update_progress_kind(self):
+        palette = self._palette
+        if self._model.progress_kind is ProgressKind.upload:
+            palette = self.palette()
+            palette.setColor(QPalette.ColorRole.Highlight, QColor(theme.progress_alt))
+        self.setPalette(palette)
+
+    def _update_progress(self):
+        if self._model.progress >= 0:
+            self.setValue(int(self._model.progress * 1000))
+        else:
+            if self.value() >= 100:
+                self.reset()
+            self.setValue(min(99, self.value() + 2))
 
 
 class GenerationWidget(QWidget):
@@ -538,6 +699,7 @@ class GenerationWidget(QWidget):
         self.refine_menu = self._create_refine_menu()
         self.generate_region_menu = self._create_generate_region_menu()
         self.refine_region_menu = self._create_refine_region_menu()
+        self.edit_menu = self._create_edit_menu()
 
         self.region_mask_button = QToolButton(self)
         self.region_mask_button.setIcon(theme.icon("region-alpha"))
@@ -561,18 +723,11 @@ class GenerationWidget(QWidget):
         actions_layout.addWidget(self.queue_button)
         layout.addLayout(actions_layout)
 
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setMinimum(0)
-        self.progress_bar.setMaximum(1000)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar = ProgressBar(self)
         layout.addWidget(self.progress_bar)
 
-        self.error_text = QLabel(self)
-        self.error_text.setStyleSheet("font-weight: bold; color: red;")
-        self.error_text.setWordWrap(True)
-        self.error_text.setVisible(False)
-        layout.addWidget(self.error_text)
+        self.error_box = ErrorBox(self)
+        layout.addWidget(self.error_box)
 
         self.history = HistoryWidget(self)
         self.history.item_activated.connect(self.apply_result)
@@ -593,6 +748,7 @@ class GenerationWidget(QWidget):
                 bind(model, "workspace", self.workspace_select, "value", Bind.one_way),
                 bind(model, "style", self.style_select, "value"),
                 bind(model, "strength", self.strength_slider, "value"),
+                bind(model, "error", self.error_box, "error", Bind.one_way),
                 bind_toggle(model, "region_only", self.region_mask_button),
                 model.inpaint.mode_changed.connect(self.update_generate_button),
                 model.strength_changed.connect(self.update_generate_button),
@@ -600,9 +756,7 @@ class GenerationWidget(QWidget):
                 model.document.layers.active_changed.connect(self.update_generate_button),
                 model.regions.active_changed.connect(self.update_generate_button),
                 model.region_only_changed.connect(self.update_generate_button),
-                model.progress_changed.connect(self.update_progress),
-                model.error_changed.connect(self.error_text.setText),
-                model.has_error_changed.connect(self.error_text.setVisible),
+                model.style_changed.connect(self.update_generate_button),
                 self.add_control_button.clicked.connect(model.regions.add_control),
                 self.add_region_button.clicked.connect(model.regions.create_region_group),
                 self.region_prompt.activated.connect(model.generate),
@@ -612,17 +766,10 @@ class GenerationWidget(QWidget):
             self.custom_inpaint.model = model
             self.generate_button.model = model
             self.queue_button.model = model
+            self.progress_bar.model = model
             self.strength_slider.model = model
             self.history.model_ = model
             self.update_generate_button()
-
-    def update_progress(self):
-        if self.model.progress >= 0:
-            self.progress_bar.setValue(int(self.model.progress * 1000))
-        else:
-            if self.progress_bar.value() >= 100:
-                self.progress_bar.reset()
-            self.progress_bar.setValue(min(99, self.progress_bar.value() + 2))
 
     def apply_result(self, item: QListWidgetItem):
         job_id, index = self.history.item_info(item)
@@ -676,10 +823,18 @@ class GenerationWidget(QWidget):
         )
         return menu
 
+    def _create_edit_menu(self):
+        menu = QMenu(self)
+        menu.addAction(self._mk_action(InpaintMode.automatic, _("Edit"), "refine"))
+        menu.addAction(self._mk_action(InpaintMode.custom, _("Edit (Custom)"), "inpaint-custom"))
+        return menu
+
     def show_inpaint_menu(self):
         width = self.generate_button.width() + self.inpaint_mode_button.width()
         pos = QPoint(0, self.generate_button.height())
-        if self.model.strength == 1.0:
+        if self.model.arch.is_edit:
+            menu = self.edit_menu
+        elif self.model.strength == 1.0:
             if self.model.region_only:
                 menu = self.generate_region_menu
             else:
@@ -711,7 +866,10 @@ class GenerationWidget(QWidget):
         if self.model.document.selection_bounds is None and not is_region_only:
             self.inpaint_mode_button.setVisible(False)
             self.custom_inpaint.setVisible(False)
-            if self.model.strength == 1.0:
+            if self.model.arch.is_edit:
+                icon = "refine"
+                text = _("Edit")
+            elif self.model.strength == 1.0:
                 icon = "workspace-generation"
                 text = _("Generate")
             else:
@@ -722,13 +880,15 @@ class GenerationWidget(QWidget):
             self.custom_inpaint.setVisible(self.model.inpaint.mode is InpaintMode.custom)
             mode = self.model.resolve_inpaint_mode()
             text = _("Generate")
-            if self.model.strength < 1:
+            if self.model.arch.is_edit:
+                text = _("Edit")
+            elif self.model.strength < 1:
                 text = _("Refine")
             if is_region_only:
                 text += " " + _("Region")
             if mode is InpaintMode.custom:
                 text += " " + _("(Custom)")
-            if self.model.strength == 1.0:
+            if self.model.strength == 1.0 and not self.model.arch.is_edit:
                 if mode is InpaintMode.custom:
                     icon = "inpaint-custom"
                 elif is_region_only:

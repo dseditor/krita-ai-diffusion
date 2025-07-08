@@ -22,20 +22,22 @@ def url_strip(url: str):
 
 
 files = {
-    url_unquote(url_strip(url)): dir / filepath
-    for m in resources.all_models()
-    for filepath, url in m.files.items()
+    url_unquote(url_strip(file.url)): dir / file.path
+    for m in resources.all_models(include_deprecated=True)
+    for file in m.files
 }
 
-urls = [url_strip(url) for m in resources.all_models() for _, url in m.files.items()]
+urls = [
+    url_strip(file.url) for m in resources.all_models(include_deprecated=True) for file in m.files
+]
 
 
 async def file_sender(file: Path):
     with open(file, "rb") as f:
-        chunk = f.read(2**16)
+        chunk = f.read(2**14)
         while chunk:
             yield chunk
-            chunk = f.read(2**16)
+            chunk = f.read(2**14)
 
 
 def send_file(file: Path):

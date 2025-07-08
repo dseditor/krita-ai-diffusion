@@ -21,11 +21,10 @@ from ..localization import translate as _
 from . import theme
 from .control import ControlListWidget
 from .widget import WorkspaceSelectWidget, StyleSelectWidget, TextPromptWidget, StrengthWidget
-from .widget import QueueButton, create_wide_tool_button
+from .widget import QueueButton, ErrorBox, create_wide_tool_button
 
 
 class AnimationWidget(QWidget):
-
     _model: Model
     _model_bindings: list[QMetaObject.Connection | Binding]
 
@@ -97,13 +96,14 @@ class AnimationWidget(QWidget):
         self.progress_bar.setFixedHeight(6)
         layout.addWidget(self.progress_bar)
 
-        self.error_text = QLabel(self)
-        self.error_text.setStyleSheet("font-weight: bold; color: red;")
-        self.error_text.setWordWrap(True)
-        self.error_text.setVisible(False)
-        layout.addWidget(self.error_text)
+        self.error_box = ErrorBox(self)
+        layout.addWidget(self.error_box)
 
         self.target_layer = QComboBox(self)
+        self.target_layer.setMinimumContentsLength(20)
+        self.target_layer.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLength
+        )
         layout.addWidget(self.target_layer)
 
         self.preview_area = QLabel(self)
@@ -131,13 +131,12 @@ class AnimationWidget(QWidget):
                 bind(model.regions, "positive", self.prompt_textbox, "text"),
                 bind(model.regions, "negative", self.negative_textbox, "text"),
                 bind(model, "strength", self.strength_slider, "value"),
+                bind(model, "error", self.error_box, "error", Bind.one_way),
                 bind_toggle(model.animation, "batch_mode", self.batch_mode_button),
                 bind_combo(model.animation, "target_layer", self.target_layer),
                 model.animation.batch_mode_changed.connect(self.update_mode),
                 model.animation.target_image_changed.connect(self.show_result),
                 model.progress_changed.connect(self.update_progress),
-                model.error_changed.connect(self.error_text.setText),
-                model.has_error_changed.connect(self.error_text.setVisible),
                 model.layers.changed.connect(self.update_target_layers),
                 self.add_control_button.clicked.connect(model.regions.add_control),
                 self.prompt_textbox.activated.connect(model.animation.generate),

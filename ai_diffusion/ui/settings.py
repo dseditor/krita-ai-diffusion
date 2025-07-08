@@ -1,7 +1,7 @@
 from __future__ import annotations
 from krita import Krita
 
-from typing import Optional, cast
+from typing import Optional
 from PyQt5.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
@@ -18,26 +18,28 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QWidget,
     QMessageBox,
+    QCheckBox,
 )
 from PyQt5.QtCore import Qt, QMetaObject, QSize, QUrl, pyqtSignal
-from PyQt5.QtGui import QDesktopServices, QGuiApplication, QCursor
+from PyQt5.QtGui import QDesktopServices, QGuiApplication, QCursor, QFontMetrics
 
-from ..client import Client, User
+from ..client import Client, User, MissingResources
 from ..cloud_client import CloudClient
-from ..resources import CustomNode, MissingResource, ResourceKind
+from ..resources import Arch, ResourceId
 from ..settings import Settings, ServerMode, PerformancePreset, settings
 from ..server import Server
 from ..style import Style
 from ..root import root
 from ..connection import ConnectionState, apply_performance_preset
+from ..updates import UpdateState
 from ..properties import Binding
 from ..localization import Localization, translate as _
-from .. import eventloop, util, __version__
+from .. import resources, eventloop, util, __version__
 from .server import ServerWidget
 from .settings_widgets import SpinBoxSetting, SliderSetting, SwitchSetting
 from .settings_widgets import SettingsTab, ComboBoxSetting, FileListSetting
 from .style import StylePresets
-from .theme import add_header, red, yellow, green, grey
+from .theme import add_header, logo, red, yellow, green, grey
 
 
 class UserWidget(QFrame):
@@ -184,6 +186,8 @@ class CloudWidget(QWidget):
             can_connect = state in [ConnectionState.disconnected, ConnectionState.error]
             self.connect_button.setEnabled(can_connect)
             self.connect_button.setText(_("Connect") if can_connect else _("Connected"))
+            self._connection_status.setText(_("Disconnected"))
+            self._connection_status.setStyleSheet(f"color: {grey}; font-style:italic")
 
         if state in [ConnectionState.error, ConnectionState.auth_error]:
             error = root.connection.error or "Unknown error"
@@ -247,12 +251,13 @@ class ConnectionSettings(SettingsTab):
         connection_layout.addLayout(server_layout)
 
         self._connection_status = QLabel(self._connection_widget)
-        self._connection_status.setWordWrap(True)
-        self._connection_status.setTextFormat(Qt.TextFormat.RichText)
-        self._connection_status.setTextInteractionFlags(
+        self._supported_workloads = QLabel(self._connection_widget)
+        self._supported_workloads.setWordWrap(True)
+        self._supported_workloads.setTextFormat(Qt.TextFormat.RichText)
+        self._supported_workloads.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextBrowserInteraction
         )
-        self._connection_status.setOpenExternalLinks(True)
+        self._supported_workloads.setOpenExternalLinks(True)
 
         anchor = _("View log files")
         open_log_button = QLabel(f"<a href='file://{util.log_dir}'>{anchor}</a>", self)
@@ -264,6 +269,7 @@ class ConnectionSettings(SettingsTab):
         status_layout.addWidget(open_log_button, alignment=Qt.AlignmentFlag.AlignRight)
 
         connection_layout.addLayout(status_layout)
+        connection_layout.addWidget(self._supported_workloads)
         connection_layout.addStretch()
 
         self._layout.addWidget(self._server_managed)
@@ -275,6 +281,7 @@ class ConnectionSettings(SettingsTab):
         self._layout.addWidget(self._server_stack)
 
         root.connection.state_changed.connect(self.update_server_status)
+        root.connection.error_changed.connect(self.update_server_status)
         self.update_server_status()
 
     @property
@@ -298,11 +305,12 @@ class ConnectionSettings(SettingsTab):
             ServerMode.cloud: self._cloud_widget,
             ServerMode.managed: self._server_widget,
             ServerMode.external: self._connection_widget,
+            ServerMode.undefined: self._connection_widget,
         }[mode]
         self._server_stack.setCurrentWidget(widget)
 
     def update_ui(self):
-        self._server_widget.update()
+        self._server_widget.update_ui()
 
     def _read(self):
         self.server_mode = settings.server_mode
@@ -341,38 +349,67 @@ class ConnectionSettings(SettingsTab):
             msg = connection.error.removeprefix("Error: ") if connection.error else "Unknown error"
             self._connection_status.setText("<b>" + _("Error") + f"</b>: {msg}")
             self._connection_status.setStyleSheet(f"color: {red};")
-            if connection.missing_resource is not None:
-                self._handle_missing_resource(connection.missing_resource)
 
-    def _handle_missing_resource(self, resource: MissingResource):
-        err = "<b>" + _("Error") + "</b>: "
-        if resource.kind is ResourceKind.checkpoint:
-            detail = _(
-                "No checkpoints found!\nCheckpoints must be placed into ComfyUI/models/checkpoints."
-            )
-            self._connection_status.setText(err + detail)
-        elif resource.kind is ResourceKind.node:
-            nodes = cast(list[CustomNode], resource.names)
-            self._connection_status.setText(
-                err
-                + _("The following ComfyUI custom nodes are missing")
+        self._supported_workloads.clear()
+        if connection.state in [ConnectionState.connected, ConnectionState.error]:
+            if connection.missing_resources is not None:
+                self._show_missing_resources(connection.missing_resources, connection.state)
+
+    def _show_missing_resources(self, res: MissingResources, state: ConnectionState):
+        def model_name(id: ResourceId, with_file=False):
+            if res := resources.find_resource(id):
+                if with_file:
+                    return f"{res.name} ({', '.join(f.name for f in res.files)})"
+                return res.name
+            if isinstance(id.identifier, str):
+                return id.identifier
+            return f"{id.kind.value} {id.identifier.value}"
+
+        text = ""
+        if isinstance(res.missing, list):
+            text = (
+                _("The following ComfyUI custom nodes are missing")
                 + ":<ul>"
-                + "\n".join((f"<li>{p.name} <a href='{p.url}'>{p.url}</a></li>" for p in nodes))
+                + "\n".join(
+                    (f"<li>{p.name} <a href='{p.url}'>{p.url}</a></li>" for p in res.missing)
+                )
                 + "</ul>"
                 + _(
                     "Please install or update the custom node package, then restart the server and try again."
                 )
+                + "<br>"
             )
         else:
-            search_paths = resource.search_path_string.replace("\n", "<br>")
-            link = "<a href='https://github.com/Acly/krita-ai-diffusion/wiki/ComfyUI-Setup'>Custom ComfyUI Setup</a>"
-            self._connection_status.setText(
-                f"{err}{str(resource)}<br>{search_paths}<br><br>"
-                + _(
-                    "See {link} for required models.<br>Check the client.log file for more details.",
-                    link=link,
-                )
-            )
+            basic = [m for lst in res.missing.values() for m in lst if m.arch is Arch.all]
+            basic = util.unique(basic, key=lambda m: m.string)
+            if len(basic) > 0:
+                text = _("Missing common models (required)") + ":\n<ul>"
+                text += "\n".join((f"<li>{model_name(m, True)}</li>" for m in basic))
+                text += "</ul>"
+            text += _("Detected base models:") + "\n<ul>"
+            for arch, missing in res.missing.items():
+                if arch in [Arch.all, Arch.illu_v]:
+                    continue
+                text += f"<li><b>{arch.value}</b>: "
+                if len(missing) == 0:
+                    text += _("supported")
+                else:
+                    names = [model_name(m) for m in missing if m.arch is arch]
+                    if len(names) > 0:
+                        text += _("missing") + " " + ", ".join(names)
+                    else:
+                        text += _("models found")
+                text += "</li>"
+            text += "</ul>"
+
+        link = "<a href='https://docs.interstice.cloud/comfyui-setup'>Custom ComfyUI Setup</a>"
+        text += _(
+            "See {link} for required models.<br>Check the client.log file for more details.",
+            link=link,
+        )
+        style = "" if state is ConnectionState.error else f"color: {grey};"
+        self._supported_workloads.setStyleSheet(style)
+        self._supported_workloads.setText(text)
 
     def _open_logs(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(util.log_dir)))
@@ -386,7 +423,7 @@ class DiffusionSettings(SettingsTab):
         self.add("selection_grow", SliderSetting(S._selection_grow, self, 0, 25, "{} %"))
         self.add("selection_feather", SliderSetting(S._selection_feather, self, 0, 25, "{} %"))
         self.add("selection_padding", SliderSetting(S._selection_padding, self, 0, 25, "{} %"))
-        self.add("nsfw_filter", ComboBoxSetting(S._nsfw_filter, self))
+        self.add("nsfw_filter", ComboBoxSetting(S._nsfw_filter, parent=self))
 
         nsfw_settings = [(_("Disabled"), 0.0), (_("Basic"), 0.65), (_("Strict"), 0.8)]
         self._widgets["nsfw_filter"].set_items(nsfw_settings)
@@ -413,13 +450,14 @@ class InterfaceSettings(SettingsTab):
         super().__init__(_("Interface Settings"))
 
         S = Settings
-        self.add("language", ComboBoxSetting(S._language, self))
-        self.add("prompt_translation", ComboBoxSetting(S._prompt_translation, self))
+        self.add("language", ComboBoxSetting(S._language, parent=self))
+        self.add("prompt_translation", ComboBoxSetting(S._prompt_translation, parent=self))
         self.add("prompt_line_count", SpinBoxSetting(S._prompt_line_count, self, 1, 10))
         self.add(
             "show_negative_prompt",
             SwitchSetting(S._show_negative_prompt, (_("Show"), _("Hide")), self),
         )
+        self.add("show_steps", SwitchSetting(S._show_steps, parent=self))
 
         self.add("tag_files", FileListSetting(S._tag_files, files=self._tag_files(), parent=self))
         self._layout.addWidget(self._widgets["tag_files"].list_widget)
@@ -434,14 +472,26 @@ class InterfaceSettings(SettingsTab):
             self._open_tag_folder,
         )
 
-        self.add("auto_preview", SwitchSetting(S._auto_preview, parent=self))
-        self.add("show_steps", SwitchSetting(S._show_steps, parent=self))
+        self.add(
+            "generation_finished_action",
+            ComboBoxSetting(S._generation_finished_action, parent=self),
+        )
+        self.add("apply_behavior", ComboBoxSetting(S._apply_behavior, parent=self))
+        self.add("apply_region_behavior", ComboBoxSetting(S._apply_region_behavior, parent=self))
+        self.add("apply_behavior_live", ComboBoxSetting(S._apply_behavior_live, parent=self))
+        self.add(
+            "apply_region_behavior_live",
+            ComboBoxSetting(S._apply_region_behavior_live, parent=self),
+        )
         self.add("new_seed_after_apply", SwitchSetting(S._new_seed_after_apply, parent=self))
         self.add("debug_dump_workflow", SwitchSetting(S._debug_dump_workflow, parent=self))
 
         languages = [(lang.name, lang.id) for lang in Localization.available]
         self._widgets["language"].set_items(languages)
         self.update_translation(root.connection.client_if_connected)
+
+        for w in ["apply_region_behavior", "apply_region_behavior_live"]:
+            self._widgets[w].show_label = False
 
         self._layout.addStretch()
 
@@ -468,7 +518,7 @@ class InterfaceSettings(SettingsTab):
         translation: ComboBoxSetting = self._widgets["prompt_translation"]
         languages = [("Disabled", "")]
         if client:
-            languages += [(lang.name, lang.code) for lang in client.supported_languages]
+            languages += [(lang.name, lang.code) for lang in client.features.languages]
         translation.enabled = client is not None
         translation.set_items(languages)
         self.read()
@@ -527,7 +577,7 @@ class PerformanceSettings(SettingsTab):
 
         add_header(self._layout, Settings._performance_preset)
         self._device_info = QLabel(self)
-        self._device_info.setStyleSheet(f"font-style:italic")
+        self._device_info.setStyleSheet("font-style:italic")
         self._layout.addWidget(self._device_info)
 
         self._performance_preset = QComboBox(self)
@@ -559,6 +609,16 @@ class PerformanceSettings(SettingsTab):
         self._max_pixel_count.value_changed.connect(self.write)
         advanced_layout.addWidget(self._max_pixel_count)
 
+        self._tiled_vae = SwitchSetting(
+            Settings._tiled_vae, text=(_("Always"), _("Automatic")), parent=self._advanced
+        )
+        self._tiled_vae.value_changed.connect(self.write)
+        advanced_layout.addWidget(self._tiled_vae)
+
+        self._dynamic_caching = SwitchSetting(Settings._dynamic_caching, parent=self)
+        self._dynamic_caching.value_changed.connect(self.write)
+        self._layout.addWidget(self._dynamic_caching)
+
         self._layout.addStretch()
 
     def _change_performance_preset(self, index):
@@ -573,12 +633,18 @@ class PerformanceSettings(SettingsTab):
         if not is_custom:
             self.read()
 
-    def update_device_info(self):
+    def update_client_info(self):
         if root.connection.state is ConnectionState.connected:
             client = root.connection.client
             self._device_info.setText(
                 _("Device")
                 + f": [{client.device_info.type.upper()}] {client.device_info.name} ({client.device_info.vram} GB)"
+            )
+            self._dynamic_caching.enabled = client.features.wave_speed
+            self._dynamic_caching.setToolTip(
+                _("The {node_name} node is not installed.").format(node_name="Comfy-WaveSpeed")
+                if not client.features.wave_speed
+                else ""
             )
 
     def _read(self):
@@ -592,7 +658,9 @@ class PerformanceSettings(SettingsTab):
         )
         self._resolution_multiplier.value = settings.resolution_multiplier
         self._max_pixel_count.value = settings.max_pixel_count
-        self.update_device_info()
+        self._tiled_vae.value = settings.tiled_vae
+        self._dynamic_caching.value = settings.dynamic_caching
+        self.update_client_info()
 
     def _write(self):
         settings.history_size = self._history_size.value
@@ -600,9 +668,163 @@ class PerformanceSettings(SettingsTab):
         settings.batch_size = int(self._batch_size.value)
         settings.resolution_multiplier = self._resolution_multiplier.value
         settings.max_pixel_count = self._max_pixel_count.value
+        settings.tiled_vae = self._tiled_vae.value
         settings.performance_preset = list(PerformancePreset)[
             self._performance_preset.currentIndex()
         ]
+        settings.dynamic_caching = self._dynamic_caching.value
+
+
+class AboutSettings(SettingsTab):
+    def __init__(self):
+        super().__init__(_("Plugin Information and Updates"))
+
+        large = self.font()
+        large.setPointSize(large.pointSize() + 2)
+
+        extra_large = self.font()
+        extra_large.setPointSize(extra_large.pointSize() + 4)
+
+        bold = self.font()
+        bold.setBold(True)
+
+        italic = self.font()
+        italic.setItalic(True)
+
+        header_layout = QHBoxLayout()
+        header_logo = QLabel(self)
+        font_height = QFontMetrics(extra_large).height() + 4
+        header_logo.setPixmap(logo().scaled(font_height * 2, font_height * 2))
+        header_logo.setMaximumSize(font_height * 2, font_height * 2)
+        header_text = QLabel("Generative AI\nfor Krita", self)
+        header_text.setFont(extra_large)
+        header_layout.addWidget(header_logo)
+        header_layout.addWidget(header_text)
+
+        current_version_name = QLabel(_("Current version") + ":", self)
+        current_version_value = QLabel(__version__, self)
+
+        latest_version_name = QLabel(_("Latest version") + ":", self)
+        self._latest_version_value = QLabel(self)
+        self._latest_version_value.setFont(bold)
+
+        self._update_error = QLabel(self)
+        self._update_error.setFont(italic)
+
+        self._update_checkbox = QCheckBox(_("Check for updates on startup"), self)
+        self._update_checkbox.setChecked(settings.auto_update)
+        self._update_checkbox.stateChanged.connect(self.write)
+
+        self._check_button = QPushButton(_("Check for Updates"), self)
+        self._check_button.setMinimumWidth(font_height * 6)
+        self._check_button.clicked.connect(self._check_updates)
+
+        self._update_button = QPushButton(_("Download and Install"), self)
+        self._update_button.setMinimumWidth(font_height * 6)
+        self._update_button.clicked.connect(self._run_update)
+
+        doc_header = QLabel(_("Documentation and Support"), self)
+        doc_header.setFont(large)
+
+        doc_links = QLabel(_links_text, self)
+        doc_links.setOpenExternalLinks(True)
+        doc_contact = QLabel(_contact_text, self)
+        doc_contact.setOpenExternalLinks(True)
+
+        self._layout.addLayout(header_layout)
+        self._layout.addSpacing(10)
+        current_version_layout = QHBoxLayout()
+        current_version_layout.addWidget(current_version_name)
+        current_version_layout.addWidget(current_version_value)
+        current_version_layout.addStretch()
+        self._layout.addLayout(current_version_layout)
+        latest_version_layout = QHBoxLayout()
+        latest_version_layout.addWidget(latest_version_name)
+        latest_version_layout.addWidget(self._latest_version_value)
+        latest_version_layout.addStretch()
+        self._layout.addLayout(latest_version_layout)
+        self._layout.addWidget(self._update_error)
+        self._layout.addWidget(self._update_checkbox)
+        update_layout = QHBoxLayout()
+        update_layout.addWidget(self._check_button)
+        update_layout.addWidget(self._update_button)
+        update_layout.addStretch()
+        self._layout.addLayout(update_layout)
+        self._layout.addSpacing(20)
+        self._layout.addWidget(doc_header)
+        self._layout.addSpacing(5)
+        doc_layout = QHBoxLayout()
+        doc_layout.addWidget(doc_links)
+        doc_layout.addSpacing(40)
+        doc_layout.addWidget(doc_contact)
+        doc_layout.addStretch()
+        self._layout.addLayout(doc_layout)
+        self._layout.addStretch()
+
+        root.auto_update.state_changed.connect(self._update_content)
+        self._update_content()
+
+    def _update_content(self):
+        self._check_button.setEnabled(False)
+        self._update_button.setEnabled(False)
+        self._update_error.clear()
+
+        au = root.auto_update
+        match au.state:
+            case UpdateState.unknown:
+                self._latest_version_value.setText(_("Not checked"))
+                self._check_button.setEnabled(True)
+            case UpdateState.checking:
+                self._latest_version_value.setText(_("Checking for updates..."))
+            case UpdateState.latest:
+                self._latest_version_value.setText(au.latest_version)
+                self._check_button.setEnabled(True)
+            case UpdateState.available:
+                self._latest_version_value.setText(au.latest_version)
+                self._check_button.setEnabled(True)
+                self._update_button.setEnabled(True)
+            case UpdateState.downloading:
+                self._latest_version_value.setText(_("Downloading package..."))
+            case UpdateState.installing:
+                self._latest_version_value.setText(_("Installing new version..."))
+            case UpdateState.failed_check:
+                self._latest_version_value.setText(_("Unknown"))
+                self._update_error.setText(au.error)
+                self._check_button.setEnabled(True)
+            case UpdateState.failed_update:
+                self._latest_version_value.setText(_("Update failed"))
+                self._update_error.setText(au.error)
+                self._check_button.setEnabled(True)
+                self._update_button.setEnabled(True)
+            case UpdateState.restart_required:
+                self._latest_version_value.setText(
+                    _("Please restart Krita to complete the update!")
+                )
+
+    def _check_updates(self):
+        root.auto_update.check()
+
+    def _run_update(self):
+        root.auto_update.run()
+
+    def _read(self):
+        self._update_checkbox.setChecked(settings.auto_update)
+
+    def _write(self):
+        settings.auto_update = self._update_checkbox.isChecked()
+
+
+_links_text = """
+<a href='https://www.interstice.cloud'>Website</a><br><br>
+<a href='https://docs.interstice.cloud'>Handbook: Guides and Tips</a><br>
+<a href='https://github.com/Acly/krita-ai-diffusion'>GitHub</a><br><br>
+"""
+
+_contact_text = """
+<a href='https://github.com/Acly/krita-ai-diffusion/issues'>Issues</a><br><br>
+<a href='https://github.com/Acly/krita-ai-diffusion/discussions'>Discussions</a><br><br>
+<a href='https://discord.gg/pWyzHfHHhU'>Discord</a>
+"""
 
 
 class SettingsDialog(QDialog):
@@ -631,6 +853,7 @@ class SettingsDialog(QDialog):
         self.diffusion = DiffusionSettings()
         self.interface = InterfaceSettings()
         self.performance = PerformanceSettings()
+        self.about = AboutSettings()
 
         self._stack = QStackedWidget(self)
         self._list = QListWidget(self)
@@ -646,6 +869,7 @@ class SettingsDialog(QDialog):
         create_list_item(_("Diffusion"), self.diffusion)
         create_list_item(_("Interface"), self.interface)
         create_list_item(_("Performance"), self.performance)
+        create_list_item(_("Plugin"), self.about)
 
         self._list.setCurrentRow(0)
         self._list.currentRowChanged.connect(self._change_page)
@@ -689,6 +913,7 @@ class SettingsDialog(QDialog):
         self.diffusion.read()
         self.interface.read()
         self.performance.read()
+        self.about.read()
 
     def restore_defaults(self):
         settings.restore()
@@ -697,7 +922,9 @@ class SettingsDialog(QDialog):
 
     def show(self, style: Optional[Style] = None):
         self.read()
+        self.connection.update_ui()
         super().show()
+
         if style:
             self._list.setCurrentRow(1)
             self.styles.current_style = style
@@ -710,7 +937,7 @@ class SettingsDialog(QDialog):
         self.connection.update_server_status()
         if root.connection.state == ConnectionState.connected:
             self.interface.update_translation(root.connection.client)
-            self.performance.update_device_info()
+            self.performance.update_client_info()
 
     def _open_settings_folder(self):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(util.user_data_dir)))

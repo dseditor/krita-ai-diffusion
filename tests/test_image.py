@@ -8,9 +8,9 @@ from .config import image_dir, result_dir, reference_dir
 
 
 def test_extent_compare():
-    assert (Extent(4, 3) < Extent(4, 4)) == True
-    assert (Extent(3, 4) < Extent(4, 4)) == True
-    assert (Extent(4, 4) < Extent(4, 4)) == False
+    assert Extent(4, 3) < Extent(4, 4)
+    assert Extent(3, 4) < Extent(4, 4)
+    assert not (Extent(4, 4) < Extent(4, 4))
 
 
 def test_extent_scale_pixel_count():
@@ -95,6 +95,18 @@ def test_image_from_pil():
     assert img.pixel(0, 0) == (255, 0, 0, 255)
 
 
+def test_image_from_packed_bytes():
+    # input has stride 3, while QImage has a minimum pixel row alignment of 4 bytes
+    data = QByteArray(b"\x00\x01\x02\x03\x04\x05")
+    img = Image.from_packed_bytes(data, Extent(3, 2), channels=1)
+    assert img.pixel(0, 0) == 0
+    assert img.pixel(1, 0) == 1
+    assert img.pixel(2, 0) == 2
+    assert img.pixel(0, 1) == 3
+    assert img.pixel(1, 1) == 4
+    assert img.pixel(2, 1) == 5
+
+
 @pytest.mark.skip("Benchmark")
 def test_image_compress_speed():
     from PyQt5.QtGui import QImageWriter
@@ -117,7 +129,7 @@ def test_image_compress_speed():
         buffer.close()
 
         end = default_timer()
-        print(f"Quality {q} | Time {end - start:.3f}s | Size {len(byte_array)//1024} kB")
+        print(f"Quality {q} | Time {end - start:.3f}s | Size {len(byte_array) // 1024} kB")
 
         file = QFile(f"beach_1536x1024_q{q}.webp")
         file.open(QIODevice.OpenModeFlag.WriteOnly)
@@ -135,7 +147,9 @@ def test_image_compress_speed():
         buffer = BytesIO()
         pil_img.save(buffer, "WEBP", lossless=True, quality=q)
         end = default_timer()
-        print(f"Compression {q} | Time {end - start:.3f}s | Size {len(buffer.getvalue())//1024} kB")
+        print(
+            f"Compression {q} | Time {end - start:.3f}s | Size {len(buffer.getvalue()) // 1024} kB"
+        )
 
 
 def test_image_equal():

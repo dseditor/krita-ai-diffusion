@@ -2,16 +2,15 @@ import sys
 import pytest
 import shutil
 import subprocess
+import dotenv
 from pathlib import Path
 from PyQt5.QtCore import QCoreApplication
 
-root_dir = Path(__file__).parent.parent
-sys.path.append(str(root_dir))
-
-from ai_diffusion import eventloop, network
-from ai_diffusion.settings import settings
-
+sys.path.append(str(Path(__file__).parent.parent))
+from ai_diffusion import eventloop, network, util
 from .config import result_dir
+
+root_dir = Path(__file__).parent.parent
 
 
 def pytest_addoption(parser):
@@ -19,6 +18,22 @@ def pytest_addoption(parser):
     parser.addoption("--pod-process", action="store_true")
     parser.addoption("--ci", action="store_true")
     parser.addoption("--benchmark", action="store_true")
+
+
+def pytest_collection_modifyitems(session, config, items: list[pytest.Item]):
+    def order(item: pytest.Item):
+        if not item.parent or "test_workflow" not in item.parent.name:
+            return 0
+        if "cloud" in item.name and "sdxl" in item.name:
+            return 4
+        elif "cloud" in item.name:
+            return 3
+        elif "sdxl" in item.name:
+            return 2
+        else:
+            return 1
+
+    items.sort(key=order)
 
 
 class QtTestApp:
@@ -36,6 +51,16 @@ class QtTestApp:
 @pytest.fixture(scope="session")
 def qtapp():
     return QtTestApp()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def clear_appdata():
+    user_dir = util.user_data_dir
+    assert user_dir.name == ".appdata", "expected local test appdata dir"
+
+    data_dir = user_dir / "data"
+    if data_dir.exists():
+        shutil.rmtree(data_dir)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -62,3 +87,9 @@ def local_download_server():
 
         proc.terminate()
         proc.wait()
+
+
+has_local_cloud = (root_dir / "service").exists()
+
+if has_local_cloud:
+    dotenv.load_dotenv(root_dir / "service" / "web" / ".env.local")

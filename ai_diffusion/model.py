@@ -1,30 +1,37 @@
 from __future__ import annotations
 import asyncio
 from copy import copy
+from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from enum import Enum
+from tempfile import TemporaryDirectory
+import time
 from typing import Any, NamedTuple
 from PyQt5.QtCore import QObject, QUuid, pyqtSignal, Qt
-from PyQt5.QtGui import QImage, QPainter, QColor, QBrush
+from PyQt5.QtGui import QPainter, QColor, QBrush
 import uuid
 
 from . import eventloop, workflow, util
-from .api import ConditioningInput, ControlInput, WorkflowKind, WorkflowInput
-from .api import InpaintMode, InpaintParams, FillMode
+from .api import ConditioningInput, ControlInput, WorkflowKind, WorkflowInput, SamplingInput
+from .api import InpaintMode, InpaintParams, FillMode, ImageInput, CustomWorkflowInput, UpscaleInput
 from .localization import translate as _
 from .util import clamp, ensure, trim_text, client_logger as log
-from .settings import ApplyBehavior, settings
+from .settings import ApplyBehavior, ApplyRegionBehavior, GenerationFinishedAction, settings
 from .network import NetworkError
 from .image import Extent, Image, Mask, Bounds, DummyImage
-from .client import ClientMessage, ClientEvent, filter_supported_styles, resolve_sd_version
+from .client import Client, ClientMessage, ClientEvent, ClientOutput
+from .client import filter_supported_styles, resolve_arch
+from .custom_workflow import CustomWorkspace, WorkflowCollection, CustomGenerationMode
 from .document import Document, KritaDocument
 from .layer import Layer, LayerType, RestoreActiveLayer
 from .pose import Pose
-from .style import Style, Styles, SDVersion
+from .style import Style, Styles, Arch
+from .files import FileLibrary
 from .connection import Connection
 from .properties import Property, ObservableProperties
 from .jobs import Job, JobKind, JobParams, JobQueue, JobState, JobRegion
-from .control import ControlLayer, ControlLayerList
+from .control import ControlLayer
 from .region import Region, RegionLink, RootRegion, process_regions, get_region_inpaint_mask
 from .resources import ControlMode
 from .resolution import compute_bounds, compute_relative_bounds
@@ -35,6 +42,42 @@ class Workspace(Enum):
     upscaling = 1
     live = 2
     animation = 3
+    custom = 4
+
+
+class ProgressKind(Enum):
+    generation = 0
+    upload = 1
+
+
+class ErrorKind(Enum):
+    none = 0
+    plugin_error = 100
+    server_error = 200
+    insufficient_funds = 201
+    warning = 300
+    incompatible_lora = 301
+
+    @property
+    def is_warning(self):
+        return self.value >= ErrorKind.warning.value
+
+
+class Error(NamedTuple):
+    kind: ErrorKind
+    message: str
+    data: dict[str, Any] | None = None
+
+    def __bool__(self):
+        return self.kind is not ErrorKind.none
+
+    @staticmethod
+    def from_string(s: str, fallback: ErrorKind | None = None):
+        kind = ErrorKind[s] if s in ErrorKind.__members__ else fallback or ErrorKind.warning
+        return Error(kind, s)
+
+
+no_error = Error(ErrorKind.none, "")
 
 
 class Model(QObject, ObservableProperties):
@@ -42,10 +85,6 @@ class Model(QObject, ObservableProperties):
     image generation. Launches generation jobs. Listens to server messages and keeps a
     list of finished, currently running and enqueued jobs.
     """
-
-    _doc: Document
-    _connection: Connection
-    _layer: Layer | None = None
 
     workspace = Property(Workspace.generation, setter="set_workspace", persist=True)
     regions: "RootRegion"
@@ -55,15 +94,12 @@ class Model(QObject, ObservableProperties):
     batch_count = Property(1, persist=True)
     seed = Property(0, persist=True)
     fixed_seed = Property(False, persist=True)
+    resolution_multiplier = Property(1.0, persist=True)
     queue_front = Property(False, persist=True)
     translation_enabled = Property(True, persist=True)
-    inpaint: CustomInpaint
-    upscale: "UpscaleWorkspace"
-    live: "LiveWorkspace"
-    animation: "AnimationWorkspace"
+    progress_kind = Property(ProgressKind.generation)
     progress = Property(0.0)
-    jobs: JobQueue
-    error = Property("")
+    error = Property(no_error)
 
     workspace_changed = pyqtSignal(Workspace)
     style_changed = pyqtSignal(Style)
@@ -72,17 +108,19 @@ class Model(QObject, ObservableProperties):
     batch_count_changed = pyqtSignal(int)
     seed_changed = pyqtSignal(int)
     fixed_seed_changed = pyqtSignal(bool)
+    resolution_multiplier_changed = pyqtSignal(float)
     queue_front_changed = pyqtSignal(bool)
     translation_enabled_changed = pyqtSignal(bool)
+    progress_kind_changed = pyqtSignal(ProgressKind)
     progress_changed = pyqtSignal(float)
-    error_changed = pyqtSignal(str)
-    has_error_changed = pyqtSignal(bool)
+    error_changed = pyqtSignal(Error)
     modified = pyqtSignal(QObject, str)
 
-    def __init__(self, document: Document, connection: Connection):
+    def __init__(self, document: Document, connection: Connection, workflows: WorkflowCollection):
         super().__init__()
         self._doc = document
         self._connection = connection
+        self._layer: Layer | None = None
         self.generate_seed()
         self.jobs = JobQueue()
         self.regions = RootRegion(self)
@@ -90,10 +128,11 @@ class Model(QObject, ObservableProperties):
         self.upscale = UpscaleWorkspace(self)
         self.live = LiveWorkspace(self)
         self.animation = AnimationWorkspace(self)
+        self.custom = CustomWorkspace(workflows, self._generate_custom, self.jobs)
 
         self.jobs.selection_changed.connect(self.update_preview)
-        self.error_changed.connect(lambda: self.has_error_changed.emit(self.has_error))
         connection.state_changed.connect(self._init_on_connect)
+        connection.error_changed.connect(self._forward_error)
         Styles.list().changed.connect(self._init_on_connect)
         self._init_on_connect()
 
@@ -104,6 +143,9 @@ class Model(QObject, ObservableProperties):
                 self.style = styles[0]
             if self.upscale.upscaler == "":
                 self.upscale.upscaler = client.models.default_upscaler
+
+    def _forward_error(self, error: str):
+        self.report_error(error if error else no_error)
 
     def generate(self):
         """Enqueue image generation for the current setup."""
@@ -122,7 +164,9 @@ class Model(QObject, ObservableProperties):
         eventloop.run(_report_errors(self, jobs))
 
     def _prepare_workflow(self, dryrun=False):
-        workflow_kind = WorkflowKind.generate if self.strength == 1.0 else WorkflowKind.refine
+        workflow_kind = WorkflowKind.generate
+        if self.strength < 1.0 or self.arch.is_edit:
+            workflow_kind = WorkflowKind.refine
         client = self._connection.client
         image = None
         inpaint_mode = InpaintMode.fill
@@ -132,7 +176,7 @@ class Model(QObject, ObservableProperties):
 
         selection_mod = get_selection_modifiers(self.inpaint.mode, self.strength)
         mask, selection_bounds = self._doc.create_mask_from_selection(
-            selection_mod.padding, invert=selection_mod.invert, min_size=64
+            selection_mod.padding, invert=selection_mod.invert, min_size=256
         )
         bounds = Bounds(0, 0, *extent)
         if mask is None:  # Check for region inpaint
@@ -152,7 +196,7 @@ class Model(QObject, ObservableProperties):
         else:
             conditioning, job_regions = ConditioningInput("", ""), []
 
-        if mask is not None or self.strength < 1.0:
+        if mask is not None or workflow_kind is WorkflowKind.refine:
             image = self._get_current_image(bounds) if not dryrun else DummyImage(bounds.extent)
 
         if mask is not None:
@@ -163,13 +207,12 @@ class Model(QObject, ObservableProperties):
 
             bounds, mask.bounds = compute_relative_bounds(bounds, mask.bounds)
 
-            sd_version = client.models.version_of(self.style.sd_checkpoint)
             if inpaint_mode is InpaintMode.custom:
                 inpaint = self.inpaint.get_params(mask)
             else:
                 pos, ctrl = conditioning.positive, conditioning.control
                 inpaint = workflow.detect_inpaint(
-                    inpaint_mode, mask.bounds, sd_version, pos, ctrl, self.strength
+                    inpaint_mode, mask.bounds, self.arch, pos, ctrl, self.strength
                 )
             inpaint.grow, inpaint.feather = selection_mod.apply(selection_bounds)
 
@@ -181,27 +224,31 @@ class Model(QObject, ObservableProperties):
             self.style,
             self.seed if self.fixed_seed else workflow.generate_seed(),
             client.models,
-            client.performance_settings,
+            FileLibrary.instance(),
+            self._performance_settings(client),
             mask=mask,
             strength=self.strength,
             inpaint=inpaint,
         )
         job_params = JobParams(bounds, prompt, regions=job_regions)
+        job_params.set_style(self.style, ensure(input.models).checkpoint)
+        job_params.metadata["prompt"] = prompt
+        job_params.metadata["negative_prompt"] = self.regions.negative
+        job_params.metadata["strength"] = self.strength
+        if len(job_regions) == 1:
+            job_params.metadata["prompt"] = job_params.name = job_regions[0].prompt
         return input, job_params
 
     async def enqueue_jobs(
         self, input: WorkflowInput, kind: JobKind, params: JobParams, count: int = 1
     ):
         sampling = ensure(input.sampling)
-        params.negative_prompt = self.regions.negative
-        params.strength = sampling.denoise_strength
         params.has_mask = input.images is not None and input.images.hires_mask is not None
-        if len(params.regions) == 1:
-            params.prompt = params.regions[0].prompt
 
         for i in range(count):
-            sampling.seed = sampling.seed + i * settings.batch_size
-            params.seed = sampling.seed
+            next_seed = sampling.seed + i * settings.batch_size
+            input = replace(input, sampling=replace(sampling, seed=next_seed))
+            params.seed = next_seed
             job = self.jobs.add(kind, copy(params))
             await self._enqueue_job(job, input)
 
@@ -212,12 +259,18 @@ class Model(QObject, ObservableProperties):
         job.id = await client.enqueue(input, self.queue_front)
 
     def _prepare_upscale_image(self, dryrun=False):
+        assert not self.arch.is_edit, "Edit models do not support upscaling"
+
+        client = self._connection.client
         extent = self._doc.extent
         image = self._doc.get_image(Bounds(0, 0, *extent)) if not dryrun else DummyImage(extent)
         params = self.upscale.params
+        params.upscale.model = params.upscale.model or client.models.default_upscaler
+        if params.upscale.model not in client.models.upscalers:
+            msg = _("The upscale model used by the document is not available on the server")
+            self.report_error(Error(ErrorKind.warning, msg + f": {params.upscale.model}"))
+            self.upscale.upscaler = params.upscale.model = client.models.default_upscaler
         bounds = Bounds(0, 0, *self._doc.extent)
-        client = self._connection.client
-        upscaler = params.upscaler or client.models.default_upscaler
         if params.use_prompt and not dryrun:
             conditioning, job_regions = process_regions(self.regions, bounds, min_coverage=0)
             conditioning.language = self.prompt_translation_language
@@ -225,7 +278,7 @@ class Model(QObject, ObservableProperties):
                 region.bounds = Bounds.scale(region.bounds, params.factor)
         else:
             conditioning, job_regions = ConditioningInput("4k uhd"), []
-        models = client.models.for_checkpoint(self.style.sd_checkpoint)
+        models = client.models.for_arch(self.arch)
         has_unblur = models.control.find(ControlMode.blur, allow_universal=True) is not None
         if has_unblur and params.unblur_strength > 0.0:
             control = ControlInput(ControlMode.blur, None, params.unblur_strength)
@@ -239,13 +292,14 @@ class Model(QObject, ObservableProperties):
                 self.style,
                 params.seed,
                 client.models,
-                client.performance_settings,
+                FileLibrary.instance(),
+                self._performance_settings(client),
                 strength=params.strength,
                 upscale_factor=params.factor,
-                upscale_model=upscaler,
+                upscale=params.upscale,
             )
         else:
-            input = workflow.prepare_upscale_simple(image, upscaler, params.factor)
+            input = workflow.prepare_upscale_simple(image, params.upscale.model, params.factor)
 
         target_bounds = Bounds(0, 0, *params.target_extent)
         name = f"{target_bounds.width}x{target_bounds.height}"
@@ -254,13 +308,14 @@ class Model(QObject, ObservableProperties):
 
     def upscale_image(self):
         try:
+            self.clear_error()
             inputs, job_params = self._prepare_upscale_image()
             job = self.jobs.add(JobKind.upscaling, job_params)
         except Exception as e:
             self.report_error(util.log_error(e))
             return
 
-        self.clear_error()
+        self.upscale.set_in_progress(True)
         eventloop.run(_report_errors(self, self._enqueue_job(job, inputs)))
 
         self._doc.resize(job.params.bounds.extent)
@@ -280,14 +335,16 @@ class Model(QObject, ObservableProperties):
             return 0
 
     def generate_live(self):
-        eventloop.run(_report_errors(self, self._generate_live()))
+        input, job_params = self._prepare_live_workflow()
+        eventloop.run(_report_errors(self, self._generate_live(input, job_params)))
 
-    async def _generate_live(self, last_input: WorkflowInput | None = None):
+    def _prepare_live_workflow(self):
         strength = self.live.strength
-        workflow_kind = WorkflowKind.generate if strength == 1.0 else WorkflowKind.refine
+        workflow_kind = WorkflowKind.generate
+        if strength < 1.0 or self.arch.is_edit:
+            workflow_kind = WorkflowKind.refine
         client = self._connection.client
-        ver = client.models.version_of(self.style.sd_checkpoint)
-        min_mask_size = 512 if ver is SDVersion.sd15 else 800
+        min_mask_size = 512 if self.arch is Arch.sd15 else 800
         extent = self._doc.extent
         region_layer = None
         job_regions: list[JobRegion] = []
@@ -311,7 +368,7 @@ class Model(QObject, ObservableProperties):
         if mask is not None:
             workflow_kind = WorkflowKind.refine_region
             bounds, mask.bounds = compute_relative_bounds(mask.bounds, mask.bounds)
-        if mask is not None or self.live.strength < 1.0:
+        if mask is not None or workflow_kind is WorkflowKind.refine:
             image = self._get_current_image(bounds)
 
         conditioning, job_regions = process_regions(self.regions, bounds)
@@ -324,28 +381,80 @@ class Model(QObject, ObservableProperties):
             self.style,
             self.seed,
             client.models,
-            client.performance_settings,
+            FileLibrary.instance(),
+            self._performance_settings(client),
             mask=mask,
             strength=self.live.strength,
             inpaint=inpaint if mask else None,
             is_live=True,
         )
-        if input != last_input:
+        params = JobParams(bounds, conditioning.positive, regions=job_regions)
+        return input, params
+
+    async def _generate_live(self, input: WorkflowInput, job_params: JobParams):
+        self.clear_error()
+        await self.enqueue_jobs(input, JobKind.live_preview, job_params)
+
+    async def _generate_custom(self, previous_input: WorkflowInput | None):
+        if self.workspace is not Workspace.custom or not self.document.is_active:
+            return False
+
+        try:
+            wf = ensure(self.custom.graph)
+            bounds = Bounds(0, 0, *self._doc.extent)
+            img_input = ImageInput.from_extent(bounds.extent)
+            img_input.initial_image = self._get_current_image(bounds)
+            is_live = self.custom.mode is CustomGenerationMode.live
+            is_anim = self.custom.mode is CustomGenerationMode.animation
+            seed = self.seed if is_live or self.fixed_seed else workflow.generate_seed()
+
+            if next(wf.find(type="ETN_KritaSelection"), None):
+                mask, _ = self._doc.create_mask_from_selection()
+                if mask:
+                    img_input.hires_mask = mask.to_image(bounds.extent)
+                else:
+                    img_input.hires_mask = Mask.transparent(bounds).to_image()
+
+            params = self.custom.collect_parameters(self.layers, bounds, is_anim)
+            input = WorkflowInput(
+                WorkflowKind.custom,
+                img_input,
+                sampling=SamplingInput("custom", "custom", 1, 1000, seed=seed),
+                custom_workflow=CustomWorkflowInput(wf.root, params),
+            )
+            job_params = JobParams(bounds, self.custom.job_name, metadata=self.custom.params)
+            job_kind = {
+                CustomGenerationMode.regular: JobKind.diffusion,
+                CustomGenerationMode.live: JobKind.live_preview,
+                CustomGenerationMode.animation: JobKind.animation,
+            }[self.custom.mode]
+
+            if input == previous_input:
+                return None
+
             self.clear_error()
-            params = JobParams(bounds, conditioning.positive, regions=job_regions)
-            await self.enqueue_jobs(input, JobKind.live_preview, params)
+            await self.enqueue_jobs(input, job_kind, job_params, self.batch_count)
             return input
 
-        return None
+        except Exception as e:
+            self.report_error(util.log_error(e))
+            return False
 
     def _get_current_image(self, bounds: Bounds):
-        exclude = None
+        exclude = []
         if self.workspace is not Workspace.live:
             exclude = [  # exclude control layers from projection
                 c.layer for c in self.regions.control if not c.mode.is_part_of_image
             ]
             if self._layer:  # exclude preview layer
                 exclude.append(self._layer)
+
+        if not any(l.is_visible and l not in exclude for l in self.layers.images):
+            warning = _(
+                "Tried to capture the current image, but there are no visible layers! Preview and control layers are not considered to be part of the input image."
+            )
+            raise ValueError(warning)
+
         return self._doc.get_image(bounds, exclude_layers=exclude)
 
     def generate_control_layer(self, control: ControlLayer):
@@ -358,7 +467,7 @@ class Model(QObject, ObservableProperties):
             image = self._doc.get_image(Bounds(0, 0, *self._doc.extent))
             mask, _ = self.document.create_mask_from_selection(padding=0.25, multiple=64)
             bounds = mask.bounds if mask else None
-            perf = self._connection.client.performance_settings
+            perf = self._performance_settings(self._connection.client)
             input = workflow.prepare_create_control_image(image, control.mode, perf, bounds)
             job = self.jobs.add_control(control, Bounds(0, 0, *image.extent))
         except Exception as e:
@@ -379,13 +488,16 @@ class Model(QObject, ObservableProperties):
         if active and self.jobs.any_executing():
             self._connection.interrupt()
 
-    def report_error(self, message: str):
-        self.error = message
+    def report_error(self, error: Error | str):
+        if isinstance(error, str):
+            error = Error.from_string(error, ErrorKind.server_error)
+        self.error = error
         self.live.is_active = False
+        self.custom.is_live = False
 
     def clear_error(self):
-        if self.error != "":
-            self.error = ""
+        if self.error:
+            self.error = no_error
 
     def handle_message(self, message: ClientMessage):
         job = self.jobs.find(message.job_id)
@@ -399,8 +511,17 @@ class Model(QObject, ObservableProperties):
             self.progress_changed.emit(-1)
         elif message.event is ClientEvent.progress:
             self.jobs.notify_started(job)
+            self.progress_kind = ProgressKind.generation
             self.progress = message.progress
+        elif message.event is ClientEvent.upload:
+            self.jobs.notify_started(job)
+            self.progress_kind = ProgressKind.upload
+            self.progress = message.progress
+        elif message.event is ClientEvent.output:
+            self.custom.show_output(message.result)
         elif message.event is ClientEvent.finished:
+            if message.error:  # successful jobs may have encountered some warnings
+                self.report_error(Error.from_string(message.error, ErrorKind.warning))
             if message.images:
                 self.jobs.set_results(job, message.images)
             if job.kind is JobKind.control_layer:
@@ -408,57 +529,89 @@ class Model(QObject, ObservableProperties):
                 job.control.layer_id = self.add_control_layer(job, message.result).id
             elif job.kind is JobKind.upscaling:
                 self.add_upscale_layer(job)
-            self.progress = 1
-            self.jobs.notify_finished(job)
-            if job.kind is not JobKind.diffusion:
-                self.jobs.remove(job)
-            elif settings.auto_preview and self._layer is None and job.id:
-                self.jobs.select(job.id, 0)
+            self._finish_job(job, message.event)
         elif message.event is ClientEvent.interrupted:
+            self._finish_job(job, message.event)
+        elif message.event is ClientEvent.error:
+            self._finish_job(job, message.event)
+            self.report_error(_("Server execution error") + f": {message.error}")
+        elif message.event is ClientEvent.payment_required:
+            self._finish_job(job, ClientEvent.error)
+            assert isinstance(message.error, str) and isinstance(message.result, dict)
+            self.report_error(Error(ErrorKind.insufficient_funds, message.error, message.result))
+
+    def _finish_job(self, job: Job, event: ClientEvent):
+        if job.kind is JobKind.upscaling:
+            self.upscale.set_in_progress(False)
+
+        if event is ClientEvent.finished:
+            self.jobs.notify_finished(job)
+            self.progress = 1
+
+            if job.id and job.kind in [JobKind.diffusion, JobKind.animation]:
+                action = settings.generation_finished_action
+                if action is GenerationFinishedAction.preview and self._layer is None:
+                    self.jobs.select(job.id, 0)
+                elif action is GenerationFinishedAction.apply:
+                    self.apply_generated_result(job.id, 0)
+        else:
             self.jobs.notify_cancelled(job)
             self.progress = 0
-        elif message.event is ClientEvent.error:
-            self.jobs.notify_cancelled(job)
-            self.report_error(_("Server execution error") + f": {message.error}")
 
     def update_preview(self):
         if selection := self.jobs.selection:
-            self.show_preview(selection.job, selection.image)
+            self.show_preview(selection[0].job, selection[0].image)
         else:
             self.hide_preview()
 
     def show_preview(self, job_id: str, index: int, name_prefix="Preview"):
         job = self.jobs.find(job_id)
         assert job is not None, "Cannot show preview, invalid job id"
-        name = f"[{name_prefix}] {trim_text(job.params.prompt, 77)}"
+        if job.kind is JobKind.animation:
+            return  # don't show animation preview on canvas (it's slow and clumsy)
+
+        name = f"[{name_prefix}] {trim_text(job.params.name, 77)}"
+        image = job.results[index]
+        bounds = job.params.bounds
+        if image.extent != bounds.extent:
+            image = Image.crop(image, Bounds(0, 0, *bounds.extent))
         if self._layer and self._layer.was_removed:
             self._layer = None  # layer was removed by user
         if self._layer is not None:
             self._layer.name = name
-            self._layer.write_pixels(job.results[index], job.params.bounds)
+            self._layer.write_pixels(image, bounds)
             self._layer.move_to_top()
         else:
-            self._layer = self.layers.create(
-                name, job.results[index], job.params.bounds, make_active=False
-            )
+            self._layer = self.layers.create(name, image, bounds, make_active=False)
             self._layer.is_locked = True
 
     def hide_preview(self):
         if self._layer is not None:
             self._layer.hide()
 
-    def apply_result(self, image: Image, params: JobParams, behavior: ApplyBehavior, prefix=""):
-        if len(params.regions) == 0:
+    def apply_result(
+        self,
+        image: Image,
+        params: JobParams,
+        behavior=ApplyBehavior.layer,
+        region_behavior=ApplyRegionBehavior.layer_group,
+        prefix="",
+    ):
+        bounds = Bounds(*params.bounds.offset, *image.extent)
+        if len(params.regions) == 0 or region_behavior is ApplyRegionBehavior.none:
             if behavior is ApplyBehavior.replace:
-                self.layers.update_layer_image(self.layers.active, image, params.bounds)
+                self.layers.update_layer_image(self.layers.active, image, bounds)
             else:
-                name = f"{prefix}{trim_text(params.prompt, 200)} ({params.seed})"
-                self.layers.create(name, image, params.bounds)
+                name = f"{prefix}{trim_text(params.name, 200)} ({params.seed})"
+                pos = self.layers.active if behavior is ApplyBehavior.layer_active else None
+                self.layers.create(name, image, bounds, above=pos)
         else:  # apply to regions
             with RestoreActiveLayer(self.layers) as restore:
                 active_id = Region.link_target(self.layers.active).id_string
                 for job_region in params.regions:
-                    result = self.create_result_layer(image, params, job_region, behavior, prefix)
+                    result = self.create_result_layer(
+                        image, params, job_region, region_behavior, prefix
+                    )
                     if job_region.layer_id == active_id:
                         restore.target = result
 
@@ -467,16 +620,16 @@ class Model(QObject, ObservableProperties):
         image: Image,
         params: JobParams,
         job_region: JobRegion,
-        behavior: ApplyBehavior,
+        behavior: ApplyRegionBehavior,
         prefix="",
     ):
         name = f"{prefix}{job_region.prompt} ({params.seed})"
         region_layer = self.layers.find(QUuid(job_region.layer_id)) or self.layers.root
-        # a previous apply from the same batch my have already created groups and re-linked
+        # a previous apply from the same batch may have already created groups and re-linked
         region_layer = Region.link_target(region_layer)
 
         # Replace content if requested and not a group layer
-        if behavior is ApplyBehavior.replace and region_layer.type is not LayerType.group:
+        if behavior is ApplyRegionBehavior.replace and region_layer.type is not LayerType.group:
             region = self.regions.find_linked(region_layer)
             new_layer = self.layers.update_layer_image(
                 region_layer, image, params.bounds, keep_alpha=True
@@ -507,14 +660,14 @@ class Model(QObject, ObservableProperties):
         has_mask = any(l.type.is_mask for l in region_layer.child_layers)
         if not region_layer.is_root and has_layers and not has_mask:
             layer_bounds = region_layer.bounds
-            if behavior is ApplyBehavior.transparency_mask:
+            if behavior is ApplyRegionBehavior.transparency_mask:
                 mask = region_layer.get_mask(layer_bounds)
                 self.layers.create_mask("Transparency Mask", mask, layer_bounds, region_layer)
             else:
                 layer_image = region_layer.get_pixels(region_bounds)
                 layer_image.draw_image(region_image, keep_alpha=True)
                 region_image = layer_image
-                if behavior is ApplyBehavior.layer_hide_below and not params.has_mask:
+                if not (behavior is ApplyRegionBehavior.no_hide or params.has_mask):
                     for layer in region_layer.child_layers:
                         layer.is_visible = False
 
@@ -531,22 +684,45 @@ class Model(QObject, ObservableProperties):
         job = self.jobs.find(job_id)
         assert job is not None, "Cannot apply result, invalid job id"
 
-        self.apply_result(job.results[index], job.params, settings.apply_behavior, "[Generated] ")
-
+        if job.kind is JobKind.animation and len(job.results) > 1:
+            self.apply_animation(job)
+        else:
+            self.apply_result(
+                job.results[index],
+                job.params,
+                settings.apply_behavior,
+                settings.apply_region_behavior,
+                "[Generated] ",
+            )
         if self._layer:
             self._layer.remove()
             self._layer = None
-        self.jobs.selection = None
+        self.jobs.selection = []
         self.jobs.notify_used(job_id, index)
 
-    def add_control_layer(self, job: Job, result: dict | None):
+    def apply_animation(self, job: Job):
+        assert job.kind is JobKind.animation
+        with TemporaryDirectory(prefix="animation") as temp_dir:
+            frames = []
+            for i, image in enumerate(job.results):
+                filename = Path(temp_dir) / f"{i:03}.png"
+                image.save(filename)
+                frames.append(filename)
+            self.document.import_animation(frames, self.document.playback_time_range[0])
+
+        async def _set_layer_name():
+            self.layers.active.name = f"[Animation] {trim_text(job.params.name, 200)}"
+
+        eventloop.run(_set_layer_name())
+
+    def add_control_layer(self, job: Job, result: ClientOutput | None):
         assert job.kind is JobKind.control_layer and job.control
-        if job.control.mode is ControlMode.pose and result is not None:
+        if job.control.mode is ControlMode.pose and isinstance(result, (dict, list)):
             pose = Pose.from_open_pose_json(result)
             pose.scale(job.params.bounds.extent)
-            return self.layers.create_vector(job.params.prompt, pose.to_svg())
+            return self.layers.create_vector(job.params.name, pose.to_svg())
         elif len(job.results) > 0:
-            return self.layers.create(job.params.prompt, job.results[0], job.params.bounds)
+            return self.layers.create(job.params.name, job.results[0], job.params.bounds)
         return self.layers.active  # Execution was cached and no image was produced
 
     def add_upscale_layer(self, job: Job):
@@ -555,7 +731,13 @@ class Model(QObject, ObservableProperties):
         if self._layer:
             self._layer.remove()
             self._layer = None
-        self.apply_result(job.results[0], job.params, settings.apply_behavior, "[Upscale] ")
+        self.apply_result(
+            job.results[0],
+            job.params,
+            settings.apply_behavior,
+            settings.apply_region_behavior,
+            "[Upscale] ",
+        )
 
     def set_workspace(self, workspace: Workspace):
         if self.workspace is Workspace.live:
@@ -587,21 +769,35 @@ class Model(QObject, ObservableProperties):
             return InpaintMode.fill
         return self.inpaint.mode
 
+    def _performance_settings(self, client: Client):
+        result = client.performance_settings
+        if self.resolution_multiplier != 1.0:
+            result.resolution_multiplier = self.resolution_multiplier
+        return result
+
+    def try_set_preview_layer(self, uid: str):
+        if uid:
+            try:
+                self._layer = self.layers.find(QUuid(uid))
+            except Exception:
+                log.warning(f"Failed to set preview layer {uid}")
+                self._layer = None
+
+    @property
+    def preview_layer_id(self):
+        return self._layer.id_string if self._layer else ""
+
     @property
     def prompt_translation_language(self):
         return settings.prompt_translation if self.translation_enabled else ""
 
     @property
-    def sd_version(self):
-        return resolve_sd_version(self.style, self._connection.client_if_connected)
+    def arch(self):
+        return resolve_arch(self.style, self._connection.client_if_connected)
 
     @property
     def history(self):
         return (job for job in self.jobs if job.state is JobState.finished)
-
-    @property
-    def has_error(self):
-        return self.error != ""
 
     @property
     def has_document(self):
@@ -612,7 +808,7 @@ class Model(QObject, ObservableProperties):
         return self._doc
 
     @document.setter
-    def document(self, doc):
+    def document(self, doc: Document):
         # Note: for some reason Krita sometimes creates a new object for an existing document.
         # The old object is deleted and unusable. This method is used to update the object,
         # but doesn't actually change the document identity.
@@ -625,6 +821,10 @@ class Model(QObject, ObservableProperties):
     @property
     def layers(self):
         return self._doc.layers
+
+    @property
+    def name(self):
+        return Path(self._doc.filename).stem
 
 
 class InpaintContext(Enum):
@@ -671,7 +871,7 @@ class CustomInpaint(QObject, ObservableProperties):
 
 
 class UpscaleParams(NamedTuple):
-    upscaler: str
+    upscale: UpscaleInput
     factor: float
     use_diffusion: bool
     unblur_strength: float
@@ -681,29 +881,39 @@ class UpscaleParams(NamedTuple):
     seed: int
 
 
+class TileOverlapMode(Enum):
+    auto = 0
+    custom = 1
+
+
 class UpscaleWorkspace(QObject, ObservableProperties):
     upscaler = Property("", persist=True)
-    factor = Property(2.0, persist=True)
+    factor = Property(2.0, persist=True, setter="_set_factor")
     use_diffusion = Property(True, persist=True)
     strength = Property(0.3, persist=True)
-    unblur_strength = Property(1, persist=True)
+    unblur_strength = Property(0.5, persist=True)
+    tile_overlap_mode = Property(TileOverlapMode.auto, persist=True)
+    tile_overlap = Property(48, persist=True)
     use_prompt = Property(False, persist=True)
+    can_generate = Property(True)
 
     upscaler_changed = pyqtSignal(str)
     factor_changed = pyqtSignal(float)
     use_diffusion_changed = pyqtSignal(bool)
     strength_changed = pyqtSignal(float)
-    unblur_strength_changed = pyqtSignal(int)
+    unblur_strength_changed = pyqtSignal(float)
+    tile_overlap_mode_changed = pyqtSignal(TileOverlapMode)
+    tile_overlap_changed = pyqtSignal(int)
     use_prompt_changed = pyqtSignal(bool)
     target_extent_changed = pyqtSignal(Extent)
+    can_generate_changed = pyqtSignal(bool)
     modified = pyqtSignal(QObject, str)
-
-    _model: Model
 
     def __init__(self, model: Model):
         super().__init__()
         self._model = model
-        self.factor_changed.connect(lambda _: self.target_extent_changed.emit(self.target_extent))
+        self._in_progress = False
+        self.use_diffusion_changed.connect(self._update_can_generate)
         self._init_model()
         model._connection.models_changed.connect(self._init_model)
 
@@ -712,24 +922,85 @@ class UpscaleWorkspace(QObject, ObservableProperties):
             if self.upscaler not in client.models.upscalers:
                 self.upscaler = client.models.default_upscaler
 
+    def set_in_progress(self, in_progress: bool):
+        self._in_progress = in_progress
+        self._update_can_generate()
+
+    def _set_factor(self, value: float):
+        if self._factor != value:
+            self._factor = value
+            self.factor_changed.emit(value)
+            self.target_extent_changed.emit(self.target_extent)
+            self._update_can_generate()
+
+    def _update_can_generate(self):
+        self.can_generate = not self._in_progress
+
     @property
     def target_extent(self):
         return self._model.document.extent * self.factor
 
     @property
     def params(self):
+        overlap = self.tile_overlap if self.tile_overlap_mode is TileOverlapMode.custom else -1
         return UpscaleParams(
-            upscaler=self.upscaler,
+            upscale=UpscaleInput(self.upscaler, overlap),
             factor=self.factor,
             use_diffusion=self.use_diffusion,
-            unblur_strength=self._unblur_strength_map[self.unblur_strength],
+            unblur_strength=self.unblur_strength,
             use_prompt=self.use_prompt,
             strength=self.strength,
             target_extent=self.target_extent,
             seed=self._model.seed if self._model.fixed_seed else workflow.generate_seed(),
         )
 
-    _unblur_strength_map = {0: 0.0, 1: 0.5, 2: 1.0}
+
+class LiveScheduler:
+    poll_rate = 0.1
+    default_grace_period = 0.25  # seconds to delay after most recent document edit
+    max_wait_time = 3.0  # maximum seconds to delay over total editing time
+    delay_threshold = 1.5  # use delay only if average generation time exceeds this value
+
+    def __init__(self):
+        self._last_input: WorkflowInput | None = None
+        self._last_change = 0.0
+        self._oldest_change = 0.0
+        self._has_changes = True
+        self._generation_start_time = 0.0
+        self._generation_times: deque[float] = deque(maxlen=10)
+
+    def should_generate(self, input: WorkflowInput):
+        now = time.monotonic()
+        if self._last_input != input:
+            self._last_input = input
+            self._last_change = now
+            if not self._has_changes:
+                self._oldest_change = now
+            self._has_changes = True
+
+        time_since_last_change = now - self._last_change
+        time_since_oldest_change = now - self._oldest_change
+        return self._has_changes and (
+            time_since_last_change >= self.grace_period
+            or time_since_oldest_change >= self.max_wait_time
+        )
+
+    def notify_generation_started(self):
+        self._generation_start_time = time.monotonic()
+        self._has_changes = False
+
+    def notify_generation_finished(self):
+        self._generation_times.append(time.monotonic() - self._generation_start_time)
+
+    @property
+    def average_generation_time(self):
+        return sum(self._generation_times) / max(1, len(self._generation_times))
+
+    @property
+    def grace_period(self):
+        if self.average_generation_time > self.delay_threshold:
+            return self.default_grace_period
+        return 0.0
 
 
 class LiveWorkspace(QObject, ObservableProperties):
@@ -746,22 +1017,17 @@ class LiveWorkspace(QObject, ObservableProperties):
     result_available = pyqtSignal(Image)
     modified = pyqtSignal(QObject, str)
 
-    _model: Model
-    _last_input: WorkflowInput | None = None
-    _result: Image | None = None
-    _result_composition: Image | None = None
-    _result_params: JobParams | None = None
-    _keyframes_folder: Path | None = None
-    _keyframe_start = 0
-    _keyframe_index = 0
-    _keyframes: list[Path]
-
-    _poll_rate = 0.1
-
     def __init__(self, model: Model):
         super().__init__()
         self._model = model
-        self._keyframes = []
+        self._scheduler = LiveScheduler()
+        self._result: Image | None = None
+        self._result_composition: Image | None = None
+        self._result_params: JobParams | None = None
+        self._keyframes_folder: Path | None = None
+        self._keyframe_start = 0
+        self._keyframe_index = 0
+        self._keyframes: list[Path] = []
         model.jobs.job_finished.connect(self.handle_job_finished)
 
     def toggle(self, active: bool):
@@ -791,16 +1057,18 @@ class LiveWorkspace(QObject, ObservableProperties):
             if len(job.results) > 0:
                 self.set_result(job.results[0], job.params)
             self.is_active = self._is_active and self._model.document.is_active
+            self._scheduler.notify_generation_finished()
             eventloop.run(_report_errors(self._model, self._continue_generating()))
 
     async def _continue_generating(self):
-        while self.is_active and self._model.document.is_active:
-            new_input = await self._model._generate_live(self._last_input)
-            if new_input is not None:  # frame was scheduled
-                self._last_input = new_input
-                return
-            # no changes in input data
-            await asyncio.sleep(self._poll_rate)
+        while self.is_active:
+            if self._model.document.is_active:
+                new_input, job_params = self._model._prepare_live_workflow()
+                if self._scheduler.should_generate(new_input):
+                    await self._model._generate_live(new_input, job_params)
+                    self._scheduler.notify_generation_started()
+                    return
+            await asyncio.sleep(self._scheduler.poll_rate)
 
     def apply_result(self, layer_only=False):
         assert self.result is not None and self._result_params is not None
@@ -810,8 +1078,12 @@ class LiveWorkspace(QObject, ObservableProperties):
             if region := next((r for r in params.regions if r.layer_id == active), None):
                 params.regions = [region]
 
-        behavior = ApplyBehavior.layer_group if layer_only else settings.apply_behavior_live
-        self._model.apply_result(self.result, params, behavior)
+        behavior = settings.apply_behavior_live
+        region_behavior = settings.apply_region_behavior_live
+        if layer_only:
+            behavior = ApplyBehavior.layer
+            region_behavior = ApplyRegionBehavior.layer_group
+        self._model.apply_result(self.result, params, behavior, region_behavior)
 
         if settings.new_seed_after_apply:
             self._model.generate_seed()
@@ -917,6 +1189,8 @@ class AnimationWorkspace(QObject, ObservableProperties):
 
     def _prepare_input(self, canvas: Image | Extent, seed: int, time: int):
         m = self._model
+        assert not m.arch.is_edit, "Cannot generate animation frames with an edit model"
+
         bounds = Bounds(0, 0, *m.document.extent)
         conditioning, _ = process_regions(m.regions, bounds, self._model.layers.root, time=time)
         conditioning.language = m.prompt_translation_language
@@ -926,8 +1200,9 @@ class AnimationWorkspace(QObject, ObservableProperties):
             conditioning,
             style=m.style,
             seed=seed,
-            perf=m._connection.client.performance_settings,
+            perf=m._performance_settings(m._connection.client),
             models=m._connection.client.models,
+            files=FileLibrary.instance(),
             strength=m.strength,
             is_live=self.sampling_quality is SamplingQuality.fast,
         )
@@ -1016,7 +1291,7 @@ class AnimationWorkspace(QObject, ObservableProperties):
         keyframes = self._keyframes.pop(job.params.animation_id)
         _, start, end = job.params.frame
         doc.import_animation(keyframes, start)
-        eventloop.run(self._update_layer_name(f"[Generated] {start}-{end}: {job.params.prompt}"))
+        eventloop.run(self._update_layer_name(f"[Generated] {start}-{end}: {job.params.name}"))
 
     async def _update_layer_name(self, name: str):
         doc = self._model.document
@@ -1081,7 +1356,7 @@ def _save_job_result(model: Model, job: Job | None, index: int):
     assert len(job.results) > index, "Cannot save result, invalid result index"
     assert model.document.filename, "Cannot save result, document is not saved"
     timestamp = job.timestamp.strftime("%Y%m%d-%H%M%S")
-    prompt = util.sanitize_prompt(job.params.prompt)
+    prompt = util.sanitize_prompt(job.params.name)
     path = Path(model.document.filename)
     path = path.parent / f"{path.stem}-generated-{timestamp}-{index}-{prompt}.png"
     path = util.find_unused_path(path)

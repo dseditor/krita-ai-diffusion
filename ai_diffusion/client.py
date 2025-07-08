@@ -1,16 +1,18 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import Any, Generator, Iterable, NamedTuple
+from typing import Any, AsyncGenerator, Iterable, NamedTuple
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .api import WorkflowInput
 from .image import ImageCollection
 from .properties import Property, ObservableProperties
-from .style import Style, Styles
+from .files import FileLibrary, FileFormat
+from .style import Style
 from .settings import PerformanceSettings
-from .resources import ControlMode, ResourceKind, SDVersion, UpscalerName
-from .resources import ResourceId, resource_id
+from .resources import ControlMode, ResourceKind, Arch, UpscalerName
+from .resources import CustomNode, ResourceId
+from .localization import translate as _
 from .util import client_logger as log
 
 
@@ -22,6 +24,25 @@ class ClientEvent(Enum):
     connected = 4
     disconnected = 5
     queued = 6
+    upload = 7
+    published = 8
+    output = 9
+    payment_required = 10
+
+
+class TextOutput(NamedTuple):
+    key: str
+    name: str
+    text: str
+    mime: str
+
+
+class SharedWorkflow(NamedTuple):
+    publisher: str
+    workflow: dict
+
+
+ClientOutput = dict | SharedWorkflow | TextOutput
 
 
 class ClientMessage(NamedTuple):
@@ -29,7 +50,7 @@ class ClientMessage(NamedTuple):
     job_id: str = ""
     progress: float = 0
     images: ImageCollection | None = None
-    result: dict | None = None
+    result: ClientOutput | None = None
     error: str | None = None
 
 
@@ -65,11 +86,23 @@ class DeviceInfo(NamedTuple):
             return DeviceInfo("cpu", "unknown", 0)
 
 
+class MissingResources(Exception):
+    def __init__(self, missing: dict[Arch, list[ResourceId]] | list[CustomNode]):
+        self.missing = missing
+
+    def __str__(self):
+        return "Required custom nodes or model files are missing"
+
+    def get(self, arch: Arch):
+        if isinstance(self.missing, list):
+            return self.missing
+        return self.missing.get(arch, [])
+
+
 class CheckpointInfo(NamedTuple):
     filename: str
-    sd_version: SDVersion
-    is_inpaint: bool = False
-    is_refiner: bool = False
+    arch: Arch
+    format: FileFormat = FileFormat.checkpoint
 
     @property
     def name(self):
@@ -77,12 +110,7 @@ class CheckpointInfo(NamedTuple):
 
     @staticmethod
     def deduce_from_filename(filename: str):
-        return CheckpointInfo(
-            filename,
-            SDVersion.from_checkpoint_name(filename),
-            "inpaint" in filename.lower(),
-            "refiner" in filename.lower(),
-        )
+        return CheckpointInfo(filename, Arch.from_checkpoint_name(filename), FileFormat.checkpoint)
 
 
 class ClientModels:
@@ -100,94 +128,110 @@ class ClientModels:
         self.resources = {}
 
     def resource(
-        self, kind: ResourceKind, identifier: ControlMode | UpscalerName | str, version: SDVersion
+        self, kind: ResourceKind, identifier: ControlMode | UpscalerName | str, arch: Arch
     ):
-        id = ResourceId(kind, version, identifier)
-        model = self.resources.get(id.string)
+        id = ResourceId(kind, arch, identifier)
+        model = self.find(id)
         if model is None:
             raise Exception(f"{id.name} not found")
         return model
 
-    def version_of(self, checkpoint: str):
+    def find(self, id: ResourceId):
+        if result := self.resources.get(id.string):
+            return result
+        # Fallback to epsilon model if v-prediction model not found
+        if id.arch is Arch.illu_v:
+            if result := self.resources.get(id._replace(arch=Arch.illu).string):
+                return result
+        # Search for architecture-agnostic model
+        return self.resources.get(id._replace(arch=Arch.all).string)
+
+    def arch_of(self, checkpoint: str):
         if info := self.checkpoints.get(checkpoint):
-            return info.sd_version
-        return SDVersion.from_checkpoint_name(checkpoint)
+            return info.arch
+        return Arch.from_checkpoint_name(checkpoint)
 
-    def for_version(self, version: SDVersion):
-        return ModelDict(self, ResourceKind.upscaler, version)
-
-    def for_checkpoint(self, checkpoint: str):
-        return self.for_version(self.version_of(checkpoint))
+    def for_arch(self, arch: Arch):
+        return ModelDict(self, ResourceKind.upscaler, arch)
 
     @property
     def upscale(self):
-        return ModelDict(self, ResourceKind.upscaler, SDVersion.all)
+        return ModelDict(self, ResourceKind.upscaler, Arch.all)
 
     @property
     def default_upscaler(self):
-        return self.resource(ResourceKind.upscaler, UpscalerName.default, SDVersion.all)
+        return self.resource(ResourceKind.upscaler, UpscalerName.default, Arch.all)
 
 
 class ModelDict:
-    """Provides access to filtered list of models matching a certain SD version."""
+    """Provides access to filtered list of models matching a certain Diffusion base model."""
 
     _models: ClientModels
     kind: ResourceKind
-    version: SDVersion
+    arch: Arch
 
-    def __init__(self, models: ClientModels, kind: ResourceKind, version: SDVersion):
+    def __init__(self, models: ClientModels, kind: ResourceKind, arch: Arch):
         self._models = models
         self.kind = kind
-        self.version = version
+        self.arch = arch
 
     def __getitem__(self, key: ControlMode | UpscalerName | str):
-        return self._models.resource(self.kind, key, self.version)
+        return self._models.resource(self.kind, key, self.arch)
 
     def find(self, key: ControlMode | UpscalerName | str, allow_universal=False) -> str | None:
-        if key in [ControlMode.style, ControlMode.composition]:
-            key = ControlMode.reference  # Same model with different weight types
-        result = self._models.resources.get(resource_id(self.kind, self.version, key))
-        if result is None and allow_universal and isinstance(key, ControlMode):
-            result = self.find(ControlMode.universal)
+        # Composition/Style modes use same IP-Adapter model as Reference with different weighting
+        is_sd = self.arch is Arch.sd15 or self.arch.is_sdxl_like
+        if key in [ControlMode.style, ControlMode.composition] and is_sd:
+            key = ControlMode.reference
+
+        result = self._models.find(ResourceId(self.kind, self.arch, key))
+        # Fallback to universal model if not found
+        if result is None and allow_universal:
+            if isinstance(key, ControlMode) and key.can_substitute_universal(self.arch):
+                result = self.find(ControlMode.universal)
         return result
 
-    def for_version(self, version: SDVersion):
-        return ModelDict(self._models, self.kind, version)
+    def for_version(self, arch: Arch):
+        return ModelDict(self._models, self.kind, arch)
 
     @property
-    def clip(self):
-        return ModelDict(self._models, ResourceKind.clip, self.version)
+    def text_encoder(self):
+        return ModelDict(self._models, ResourceKind.text_encoder, self.arch)
 
     @property
     def clip_vision(self):
-        return self._models.resource(ResourceKind.clip_vision, "ip_adapter", SDVersion.all)
+        return self._models.resource(ResourceKind.clip_vision, "ip_adapter", self.arch)
 
     @property
     def upscale(self):
-        return ModelDict(self._models, ResourceKind.upscaler, SDVersion.all)
+        return ModelDict(self._models, ResourceKind.upscaler, Arch.all)
 
     @property
     def control(self):
-        return ModelDict(self._models, ResourceKind.controlnet, self.version)
+        return ModelDict(self._models, ResourceKind.controlnet, self.arch)
 
     @property
     def ip_adapter(self):
-        return ModelDict(self._models, ResourceKind.ip_adapter, self.version)
+        return ModelDict(self._models, ResourceKind.ip_adapter, self.arch)
 
     @property
     def inpaint(self):
-        return ModelDict(self._models, ResourceKind.inpaint, SDVersion.all)
+        return ModelDict(self._models, ResourceKind.inpaint, Arch.all)
 
     @property
     def lora(self):
-        return ModelDict(self._models, ResourceKind.lora, self.version)
+        return ModelDict(self._models, ResourceKind.lora, self.arch)
+
+    @property
+    def vae(self):
+        return self._models.resource(ResourceKind.vae, "default", self.arch)
 
     @property
     def fooocus_inpaint(self):
-        assert self.version is SDVersion.sdxl
+        assert self.arch is Arch.sdxl
         return dict(
-            head=self._models.resource(ResourceKind.inpaint, "fooocus_head", SDVersion.sdxl),
-            patch=self._models.resource(ResourceKind.inpaint, "fooocus_patch", SDVersion.sdxl),
+            head=self._models.resource(ResourceKind.inpaint, "fooocus_head", Arch.sdxl),
+            patch=self._models.resource(ResourceKind.inpaint, "fooocus_patch", Arch.sdxl),
         )
 
     @property
@@ -197,6 +241,15 @@ class ModelDict:
     @property
     def node_inputs(self):
         return self._models.node_inputs
+
+    @property
+    def has_te_vae(self):
+        if self._models.find(ResourceId(ResourceKind.vae, self.arch, "default")) is None:
+            return False
+        for te in self.arch.text_encoders:
+            if self._models.find(ResourceId(ResourceKind.text_encoder, self.arch, te)) is None:
+                return False
+        return True
 
 
 class TranslationPackage(NamedTuple):
@@ -212,6 +265,16 @@ class TranslationPackage(NamedTuple):
         return [TranslationPackage.from_dict(item) for item in data]
 
 
+class ClientFeatures(NamedTuple):
+    ip_adapter: bool = True
+    translation: bool = True
+    languages: list[TranslationPackage] = []
+    max_upload_size: int = 0
+    max_control_layers: int = 1000
+    wave_speed: bool = False
+    gguf: bool = False
+
+
 class Client(ABC):
     url: str
     models: ClientModels
@@ -225,7 +288,7 @@ class Client(ABC):
     async def enqueue(self, work: WorkflowInput, front: bool = False) -> str: ...
 
     @abstractmethod
-    async def listen(self) -> Generator[ClientMessage, Any, None]: ...
+    def listen(self) -> AsyncGenerator[ClientMessage, Any]: ...
 
     @abstractmethod
     async def interrupt(self): ...
@@ -239,35 +302,50 @@ class Client(ABC):
     async def translate(self, text: str, lang: str) -> str:
         return text
 
+    async def disconnect(self):
+        pass
+
     @property
     def user(self) -> User | None:
         return None
 
-    def supports_version(self, version: SDVersion) -> bool:
+    @property
+    def missing_resources(self) -> MissingResources | None:
+        return None
+
+    def supports_arch(self, arch: Arch) -> bool:
+        if self.missing_resources:
+            return len(self.missing_resources.get(arch)) == 0
         return True
 
     @property
-    def supports_ip_adapter(self) -> bool:
-        return True
-
-    @property
-    def supports_translation(self) -> bool:
-        return False
-
-    @property
-    def supported_languages(self) -> list[TranslationPackage]:
-        return []
+    def features(self) -> ClientFeatures: ...
 
     @property
     def performance_settings(self) -> PerformanceSettings: ...
 
+    async def __aenter__(self):
+        return self
 
-def resolve_sd_version(style: Style, client: Client | None = None):
-    if style.sd_version is SDVersion.auto:
-        if client and style.sd_checkpoint in client.models.checkpoints:
-            return client.models.version_of(style.sd_checkpoint)
-        return style.sd_version.resolve(style.sd_checkpoint)
-    return style.sd_version
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.disconnect()
+
+
+def resolve_arch(style: Style, client: Client | ClientModels | None = None):
+    arch = Arch.auto
+
+    if client:
+        models = client.models if isinstance(client, Client) else client
+        checkpoint = style.preferred_checkpoint(models.checkpoints.keys())
+        if checkpoint != "not-found":
+            arch = models.arch_of(checkpoint)
+    elif style.checkpoints:
+        arch = style.architecture.resolve(style.checkpoints[0])
+
+    if style.architecture.is_sdxl_like and arch.is_sdxl_like:
+        arch = style.architecture  # user override with compatible arch
+
+    return arch
 
 
 def filter_supported_styles(styles: Iterable[Style], client: Client | None = None):
@@ -275,7 +353,35 @@ def filter_supported_styles(styles: Iterable[Style], client: Client | None = Non
         return [
             style
             for style in styles
-            if client.supports_version(resolve_sd_version(style, client))
-            and style.sd_checkpoint in client.models.checkpoints
+            if client.supports_arch(resolve_arch(style, client))
+            and style.preferred_checkpoint(client.models.checkpoints.keys()) != "not-found"
         ]
     return list(styles)
+
+
+def loras_to_upload(workflow: WorkflowInput, client_models: ClientModels):
+    workflow_loras = []
+    if models := workflow.models:
+        workflow_loras.extend(models.loras)
+    if cond := workflow.conditioning:
+        for region in cond.regions:
+            workflow_loras.extend(region.loras)
+
+    for lora in workflow_loras:
+        if lora.name in client_models.loras:
+            continue
+        if not lora.storage_id and lora.name in _lcm_loras:
+            raise ValueError(_lcm_warning)
+        if not lora.storage_id:
+            raise ValueError(f"Lora model is not available: {lora.name}")
+        lora_file = FileLibrary.instance().loras.find_local(lora.name)
+        if lora_file is None or lora_file.path is None:
+            raise ValueError(f"Can't find Lora model: {lora.name}")
+        if not lora_file.path.exists():
+            raise ValueError(_("LoRA model file not found") + f" {lora_file.path}")
+        assert lora.storage_id == lora_file.hash
+        yield lora_file
+
+
+_lcm_loras = ["lcm-lora-sdv1-5.safetensors", "lcm-lora-sdxl.safetensors"]
+_lcm_warning = "LCM is no longer supported by the server. Please change the Style's sampling method to 'Realtime - Hyper'"

@@ -1,10 +1,10 @@
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import os
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Optional, Any
+from typing import NamedTuple, Optional, Any
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .util import is_macos, is_windows, user_data_dir, client_logger as log
@@ -24,6 +24,7 @@ class ServerBackend(Enum):
     cuda = (_("Use CUDA (NVIDIA GPU)"), not is_macos)
     mps = (_("Use MPS (Metal Performance Shader)"), is_macos)
     directml = (_("Use DirectML (GPU)"), is_windows)
+    xpu = (_("Use XPU (Intel GPU)"), not is_macos)
 
     @staticmethod
     def supported():
@@ -37,12 +38,24 @@ class ServerBackend(Enum):
             return ServerBackend.cuda
 
 
+class GenerationFinishedAction(Enum):
+    none = _("Do Nothing")
+    preview = _("Preview")
+    apply = _("Apply")
+
+
 class ApplyBehavior(Enum):
-    replace = 0
-    layer = 1
-    layer_group = 2
-    layer_hide_below = 3
-    transparency_mask = 4
+    replace = _("Modify active layer")
+    layer = _("New layer on top")
+    layer_active = _("New layer above active")
+
+
+class ApplyRegionBehavior(Enum):
+    none = _("Do not update regions")
+    replace = _("Modify region layers")
+    layer_group = _("Layer group")
+    transparency_mask = _("Layer group + mask")
+    no_hide = _("Layer group (don't hide)")
 
 
 class PerformancePreset(Enum):
@@ -55,11 +68,20 @@ class PerformancePreset(Enum):
     custom = _("Custom")
 
 
+class PerformancePresetSettings(NamedTuple):
+    batch_size: int = 4
+    resolution_multiplier: float = 1.0
+    max_pixel_count: int = 6
+    tiled_vae: bool = False
+
+
 @dataclass
 class PerformanceSettings:
     batch_size: int = 4
     resolution_multiplier: float = 1.0
     max_pixel_count: int = 6
+    dynamic_caching: bool = False
+    tiled_vae: bool = False
 
 
 class Setting:
@@ -87,6 +109,11 @@ class Settings(QObject):
         _("Language"),
         "en",
         _("Interface language used by the plugin - requires restart!"),
+    )
+
+    auto_update: bool
+    _auto_update = Setting(
+        _("Enable Automatic Updates"), True, _("Check for new versions of the plugin on startup")
     )
 
     server_mode: ServerMode
@@ -162,14 +189,19 @@ class Settings(QObject):
         _("Prompt Line Count"), 2, _("Size of the text editor for image descriptions")
     )
 
+    prompt_line_count_live: int
+    _prompt_line_count_live = Setting("Prompt Line Count (Live)", 2)
+
     show_negative_prompt: bool
     _show_negative_prompt = Setting(
         _("Negative Prompt"), False, _("Show text editor to describe things to avoid")
     )
 
-    auto_preview: bool
-    _auto_preview = Setting(
-        _("Auto Preview"), True, _("Automatically preview the first generated result on the canvas")
+    generation_finished_action: GenerationFinishedAction
+    _generation_finished_action = Setting(
+        _("Finished Generation"),
+        GenerationFinishedAction.preview,
+        _("Action to take when an image generation job finishes"),
     )
 
     show_steps: bool
@@ -187,15 +219,23 @@ class Settings(QObject):
     apply_behavior: ApplyBehavior
     _apply_behavior = Setting(
         _("Apply Behavior"),
-        ApplyBehavior.layer_hide_below,
+        ApplyBehavior.layer,
         _("Choose how result images are applied to the canvas (generation workspaces)"),
     )
 
+    apply_region_behavior: ApplyRegionBehavior
+    _apply_region_behavior = Setting("Apply Region Behavior", ApplyRegionBehavior.layer_group)
+
     apply_behavior_live: ApplyBehavior
     _apply_behavior_live = Setting(
-        "Apply Behavior (Live)",
+        _("Apply Behavior (Live)"),
         ApplyBehavior.replace,
-        "Choose how result images are applied to the canvas in Live mode",
+        _("Choose how result images are applied to the canvas in Live mode"),
+    )
+
+    apply_region_behavior_live: ApplyRegionBehavior
+    _apply_region_behavior_live = Setting(
+        "Apply Region Behavior (Live)", ApplyRegionBehavior.replace
     )
 
     show_builtin_styles: bool
@@ -245,28 +285,43 @@ class Settings(QObject):
         _("Maximum resolution to generate images at, in megapixels (FullHD ~ 2MP, 4k ~ 8MP)."),
     )
 
+    dynamic_caching: bool
+    _dynamic_caching = Setting(
+        _("Dynamic Caching"),
+        False,
+        _("Re-use outputs of previous steps (First Block Cache) to speed up generation."),
+    )
+
+    tiled_vae: bool
+    _tiled_vae = Setting(
+        _("Tiled VAE"),
+        False,
+        _("Conserve memory by processing output images in smaller tiles."),
+    )
+
     _performance_presets = {
-        PerformancePreset.cpu: PerformanceSettings(
+        PerformancePreset.cpu: PerformancePresetSettings(
             batch_size=1,
             resolution_multiplier=1.0,
             max_pixel_count=2,
         ),
-        PerformancePreset.low: PerformanceSettings(
+        PerformancePreset.low: PerformancePresetSettings(
             batch_size=2,
             resolution_multiplier=1.0,
             max_pixel_count=2,
+            tiled_vae=True,
         ),
-        PerformancePreset.medium: PerformanceSettings(
+        PerformancePreset.medium: PerformancePresetSettings(
             batch_size=4,
             resolution_multiplier=1.0,
             max_pixel_count=6,
         ),
-        PerformancePreset.high: PerformanceSettings(
+        PerformancePreset.high: PerformancePresetSettings(
             batch_size=6,
             resolution_multiplier=1.0,
             max_pixel_count=8,
         ),
-        PerformancePreset.cloud: PerformanceSettings(
+        PerformancePreset.cloud: PerformancePresetSettings(
             batch_size=8,
             resolution_multiplier=1.0,
             max_pixel_count=6,
@@ -301,10 +356,12 @@ class Settings(QObject):
 
     def __setattr__(self, name: str, value):
         if name in self._values:
-            self._values[name] = value
-            self.changed.emit(name, value)
-            if name == "performance_preset":
-                self.apply_performance_preset(value)
+            if self._values[name] != value:
+                self._values[name] = value
+                if name != "document_defaults":
+                    self.changed.emit(name, value)
+                if name == "performance_preset":
+                    self.apply_performance_preset(value)
         else:
             object.__setattr__(self, name, value)
 
@@ -345,7 +402,7 @@ class Settings(QObject):
 
     def apply_performance_preset(self, preset: PerformancePreset):
         if preset not in [PerformancePreset.custom, PerformancePreset.auto]:
-            for k, v in asdict(self._performance_presets[preset]).items():
+            for k, v in self._performance_presets[preset]._asdict().items():
                 self._values[k] = v
 
     def _migrate_legacy_settings(self, path: Path):

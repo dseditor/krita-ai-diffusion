@@ -9,7 +9,7 @@ from .image import Image, Bounds, Extent
 from .document import Layer, LayerType
 from .properties import Property, ObservableProperties
 from .jobs import JobRegion
-from .control import ControlLayer, ControlLayerList
+from .control import ControlLayerList
 from .settings import settings
 
 
@@ -242,7 +242,7 @@ class RootRegion(QObject, ObservableProperties):
             layer = target
         elif group:
             layer = layers.create_group(f"Region {len(self)}")
-            layers.create(f"Paint layer", parent=layer)
+            layers.create("Paint layer", parent=layer)
         else:
             layer = layers.create(f"Region {len(self)}")
         return self._add(layer)
@@ -258,7 +258,7 @@ class RootRegion(QObject, ObservableProperties):
         regions = []
         for l in layers:
             r = self._find_region(l)
-            if r is not None and r is not exclude and not r in regions:
+            if r is not None and r is not exclude and r not in regions:
                 regions.append(r)
         return regions
 
@@ -355,7 +355,7 @@ def translate_prompt(region: Region | RootRegion):
     from .root import root
 
     if client := root.connection.client_if_connected:
-        if settings.prompt_translation and client.supports_translation:
+        if settings.prompt_translation and client.features.translation:
             eventloop.run(region.translate_prompt(client))
 
 
@@ -437,7 +437,7 @@ def process_regions(
         coverage = mask.average()
         if coverage > 0.9 and min_coverage > 0:
             # Single region covers (almost) entire image, don't use regional conditioning.
-            result.positive = workflow.merge_prompt(region.positive, root.positive)
+            result.positive = region.positive
             result.control += region.control
             return result, [job_region]
         elif coverage < min_coverage:
