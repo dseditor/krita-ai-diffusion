@@ -64,6 +64,14 @@ class CheckpointInput:
     self_attention_guidance: bool = False
     dynamic_caching: bool = False
     tiled_vae: bool = False
+    
+    # MagCache 參數 - 僅針對 Flux
+    magcache_enabled: bool = False
+    magcache_thresh: float = 0.24  # Flux 默認值
+    magcache_retention_ratio: float = 0.1  # Flux 默認值
+    magcache_K: int = 5  # Flux 默認值
+    magcache_start_step: int = 0
+    magcache_end_step: int = -1
 
 
 @dataclass
